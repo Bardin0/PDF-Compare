@@ -176,13 +176,13 @@ class PDFDiffViewer(QMainWindow):
 
         # View menu as QToolButton
         view_menu = QMenu("View", self)
-        self.action_next_diff = QAction("Next Diff", self)
-        self.action_prev_diff = QAction("Previous Diff", self)
-        self.action_reset_view = QAction("Reset View", self)  # <-- new action
+        self.action_next_diff = QAction("Next Diff (Alt+→)", self)
+        self.action_prev_diff = QAction("Previous Diff (Alt+←)", self)
+        self.action_reset_view = QAction("Reset View (Alt+↓)", self)
         view_menu.addAction(self.action_next_diff)
         view_menu.addAction(self.action_prev_diff)
         view_menu.addSeparator()
-        view_menu.addAction(self.action_reset_view)  # <-- added Reset View
+        view_menu.addAction(self.action_reset_view)
         view_button = QToolButton()
         view_button.setText("View")
         view_button.setMenu(view_menu)
@@ -192,8 +192,8 @@ class PDFDiffViewer(QMainWindow):
 
         # Navigation/compare actions as toolbar buttons
         self.action_compare = QAction("Compare", self)
-        self.action_prev = QAction("Previous Page", self)
-        self.action_next = QAction("Next Page", self)
+        self.action_prev = QAction("Previous Page (Ctrl+←)", self)
+        self.action_next = QAction("Next Page (Ctrl+→)", self)
         toolbar.addAction(self.action_compare)
         toolbar.addAction(self.action_prev)
         toolbar.addAction(self.action_next)
@@ -257,8 +257,12 @@ class PDFDiffViewer(QMainWindow):
         self.action_reset_view.triggered.connect(self.reset_view)  # Connect reset action
 
         # Add keyboard shortcuts for diff navigation
+        # Add keyboard shortcuts for page navigation
+        QShortcut(QKeySequence("Ctrl+Right"), self, self.next_page)
+        QShortcut(QKeySequence("Ctrl+Left"), self, self.prev_page)
         QShortcut(QKeySequence("Alt+Right"), self, lambda: self.goto_diff(1))
         QShortcut(QKeySequence("Alt+Left"), self, lambda: self.goto_diff(-1))
+        QShortcut(QKeySequence("Alt+Down"), self, self.reset_view)
 
     def export_compared_pdf(self):
         """
