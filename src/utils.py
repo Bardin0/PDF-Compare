@@ -2,8 +2,7 @@
 """
 Shared utilities: caching, transforms, etc.
 """
-import functools
-import os
+
 import hashlib
 
 # Example: simple in-memory cache for rendered images
