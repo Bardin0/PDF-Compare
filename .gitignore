@@ -1,0 +1,11 @@
+IMPLEMENTATION_PLAN.md
+venv/
+build/
+dist/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+.github/instructions/

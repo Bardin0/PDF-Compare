@@ -1,0 +1,8 @@
+# requirements.txt for PDF Image Diff Viewer
+pymupdf
+opencv-python
+scikit-image
+pytesseract
+PySide6
+reportlab
+img2pdf
