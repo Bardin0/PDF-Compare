@@ -23,6 +23,135 @@ from src.spinner import LoadingSpinner
 
 logging.basicConfig(level=logging.INFO)
 
+# --- FadeCompositeWidget for fade mode ---
+class FadeCompositeWidget(QWidget):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent = parent
+        self.fade_value = 50
+        self._cache = {}
+        self.fade_temp_diff_rect = None
+
+    def wheelEvent(self, event):
+        # Zoom in/out on wheel
+        viewer = self.parent
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+        zoom_step = 1.25
+        old_zoom = viewer.zoom_factor
+        if delta > 0:
+            new_zoom = min(old_zoom * zoom_step, 10.0)
+        else:
+            new_zoom = max(old_zoom / zoom_step, 0.1)
+        if abs(new_zoom - old_zoom) < 1e-6:
+            return
+        # Use mouse position as zoom center
+        pos = event.position() if hasattr(event, 'position') else event.posF()
+        cx, cy = int(pos.x()), int(pos.y())
+        viewer.set_zoom(new_zoom, center=(self, (cx, cy)), update_controls=True)
+        self._invalidate_cache()
+        self.repaint()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_active = True
+            self._last_pos = event.pos()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        viewer = self.parent
+        if (event.buttons() & Qt.LeftButton) and getattr(self, '_drag_active', False) and getattr(self, '_last_pos', None) is not None:
+            delta = event.pos() - self._last_pos
+            self._last_pos = event.pos()
+            speed = 2.0
+            dx = int(delta.x() * speed / max(viewer.zoom_factor, 1e-6))
+            dy = int(delta.y() * speed / max(viewer.zoom_factor, 1e-6))
+            viewer._pan[0] += dx
+            viewer._pan[1] += dy
+            viewer.show_page_a()
+            viewer.show_page_b()
+            viewer.show_diff()
+            self._invalidate_cache()
+            self.repaint()
+        else:
+            self._drag_active = False
+            self._last_pos = None
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_active = False
+            self._last_pos = None
+        super().mouseReleaseEvent(event)
+
+    def leaveEvent(self, event):
+        self._drag_active = False
+        self._last_pos = None
+        super().leaveEvent(event)
+
+    def set_fade_value(self, value):
+        if getattr(self, 'fade_value', None) == value:
+            return
+        self.fade_value = value
+        self.repaint()
+
+    def _invalidate_cache(self):
+        self._cache = {}
+
+    def _get_cached_images(self, viewer):
+        key = (
+            viewer.pageA, viewer.pageB, viewer.zoom_factor,
+            tuple(getattr(viewer, '_pan', [0.0, 0.0])),
+            self.width(), self.height()
+        )
+        cache = getattr(self, '_cache', {})
+        if cache.get('key') == key:
+            return cache['qimgA'], cache['qimgB'], cache['imgA'], cache['imgB']
+        imgA = viewer.rendererA.render_page(viewer.pageA, dpi=viewer.dpi)
+        imgB = viewer.rendererB.render_page(viewer.pageB, dpi=viewer.dpi)
+        imgA_scaled = viewer.scale_to_label(imgA, self, zoom=viewer.zoom_factor)
+        imgB_scaled = viewer.scale_to_label(imgB, self, zoom=viewer.zoom_factor)
+        qimgA = viewer.np_to_pixmap(imgA_scaled).toImage()
+        qimgB = viewer.np_to_pixmap(imgB_scaled).toImage()
+        self._cache = {'key': key, 'qimgA': qimgA, 'qimgB': qimgB, 'imgA': imgA_scaled, 'imgB': imgB_scaled}
+        return qimgA, qimgB, imgA_scaled, imgB_scaled
+
+    def paintEvent(self, event):
+        from PySide6.QtGui import QPainter, QPen, QColor
+        viewer = self.parent
+        if not (viewer.rendererA and viewer.rendererB):
+            return
+        qimgA, qimgB, imgA, imgB = self._get_cached_images(viewer)
+        painter = QPainter(self)
+        w = self.width()
+        h = self.height()
+        alpha_b = self.fade_value / 100.0
+        alpha_a = 1.0 - alpha_b
+        # Draw A with alpha_a
+        painter.setOpacity(alpha_a)
+        painter.drawImage(0, 0, qimgA)
+        # Draw B with alpha_b
+        painter.setOpacity(alpha_b)
+        painter.drawImage(0, 0, qimgB)
+        painter.setOpacity(1.0)
+        # Draw temp diff rectangle if set
+        rect = getattr(viewer, 'fade_temp_diff_rect', None)
+        if rect is not None:
+            x, y, bw, bh = rect
+            img_h, img_w = imgA.shape[:2]
+            scale_x = w / img_w
+            scale_y = h / img_h
+            rect_x = int(x * scale_x)
+            rect_y = int(y * scale_y)
+            rect_w = int(bw * scale_x)
+            rect_h = int(bh * scale_y)
+            pen = QPen(QColor(255, 0, 0), 3)
+            pen.setStyle(Qt.SolidLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(rect_x, rect_y, rect_w, rect_h)
+        painter.end()
 
 class PDFDiffViewer(QMainWindow):
     def __init__(self, *args, **kwargs):
@@ -197,9 +326,11 @@ class PDFDiffViewer(QMainWindow):
         self.mode_group = QActionGroup(self)
         self.action_highlight_view = QAction("Highlight", self, checkable=True, checked=True)
         self.action_slider_view = QAction("Slider", self, checkable=True)
+        self.action_fade_view = QAction("Fade", self, checkable=True)
         self.mode_group.setExclusive(True)
         self.mode_group.addAction(self.action_highlight_view)
         self.mode_group.addAction(self.action_slider_view)
+        self.mode_group.addAction(self.action_fade_view)
         self.action_next_diff = QAction("Next Diff", self, toolTip="Next Diff (Alt+→)")
         self.action_prev_diff = QAction("Previous Diff", self, toolTip="Previous Diff (Alt+←)")
         self.action_reset_view = QAction("Reset View", self, toolTip="Reset View (Ctrl+↓)")
@@ -253,23 +384,42 @@ class PDFDiffViewer(QMainWindow):
         self.slider_composite = SliderCompositeWidget(self)
         slider_layout.addWidget(self.slider_composite)
 
-        # --- QStackedWidget to switch between highlight and slider views ---
+        # --- Fade View Container (single composite widget) ---
+        self.fade_view_container = QWidget()
+        fade_layout = QVBoxLayout(self.fade_view_container)
+        fade_layout.setContentsMargins(0, 0, 0, 0)
+        self.fade_composite = FadeCompositeWidget(self)
+        fade_layout.addWidget(self.fade_composite)
+
+        # --- QStackedWidget to switch between highlight, slider, and fade views ---
         from PySide6.QtWidgets import QStackedWidget
         self.stacked_widget = QStackedWidget()
         self.stacked_widget.addWidget(self.highlight_view_container)  # index 0
         self.stacked_widget.addWidget(self.slider_view_container)     # index 1
+        self.stacked_widget.addWidget(self.fade_view_container)       # index 2
         main_layout.addWidget(self.stacked_widget)
 
-        # Slider for slider view (controls reveal boundary)
+        # Slider for slider/fade view (controls reveal boundary or opacity) with labels
+        self.slider_bar_widget = QWidget()
+        self.slider_bar_layout = QHBoxLayout(self.slider_bar_widget)
+        self.slider_bar_layout.setContentsMargins(0, 0, 0, 0)
+        self.slider_label_left = QLabel("A")
+        self.slider_label_left.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setMinimum(0)
         self.slider.setMaximum(100)
         self.slider.setValue(50)
         self.slider.setTickInterval(1)
         self.slider.setSingleStep(1)
-        self.slider.valueChanged.connect(self.slider_composite.set_slider_value)
+        self.slider.valueChanged.connect(self._on_slider_value_changed)
         self.slider.hide()
-        main_layout.addWidget(self.slider)
+        self.slider_label_right = QLabel("B")
+        self.slider_label_right.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.slider_bar_layout.addWidget(self.slider_label_left)
+        self.slider_bar_layout.addWidget(self.slider)
+        self.slider_bar_layout.addWidget(self.slider_label_right)
+        self.slider_bar_widget.hide()  # Hide by default, show with slider
+        main_layout.addWidget(self.slider_bar_widget)
 
         # Bottom bar
         bottom_bar = QHBoxLayout()
@@ -322,6 +472,7 @@ class PDFDiffViewer(QMainWindow):
         self.action_reset_view.triggered.connect(self.reset_view)
         self.action_highlight_view.triggered.connect(lambda: self.change_view_mode("highlight"))
         self.action_slider_view.triggered.connect(lambda: self.change_view_mode("slider"))
+        self.action_fade_view.triggered.connect(lambda: self.change_view_mode("fade"))
 
         QShortcut(QKeySequence("Ctrl+Right"), self, self.next_page)
         QShortcut(QKeySequence("Ctrl+Left"), self, self.prev_page)
@@ -334,10 +485,28 @@ class PDFDiffViewer(QMainWindow):
         if mode == "highlight":
             self.stacked_widget.setCurrentIndex(0)
             self.slider.hide()
+            self.slider_bar_widget.hide()
         elif mode == "slider":
             self.stacked_widget.setCurrentIndex(1)
             self.slider.show()
+            self.slider_bar_widget.show()
+            self.slider_label_left.setText("A")
+            self.slider_label_right.setText("B")
+        elif mode == "fade":
+            self.stacked_widget.setCurrentIndex(2)
+            self.slider.show()
+            self.slider_bar_widget.show()
+            self.slider_label_left.setText("A")
+            self.slider_label_right.setText("B")
         self.slider_composite.repaint()
+        if hasattr(self, 'fade_composite'):
+            self.fade_composite.repaint()
+
+    def _on_slider_value_changed(self, value):
+        if self.current_mode == "slider":
+            self.slider_composite.set_slider_value(value)
+        elif self.current_mode == "fade":
+            self.fade_composite.set_fade_value(value)
 
     def export_compared_pdf(self):
         if not self.diffs:
@@ -394,9 +563,21 @@ class PDFDiffViewer(QMainWindow):
         self.show_page_a()
         self.show_page_b()
         self.show_diff()
-        # Also reset and update slider view
+        # Invalidate and repaint slider and fade views on zoom
+        if hasattr(self, 'slider_composite'):
+            if hasattr(self.slider_composite, '_invalidate_cache'):
+                self.slider_composite._invalidate_cache()
+            self.slider_composite.repaint()
+        if hasattr(self, 'fade_composite'):
+            if hasattr(self.fade_composite, '_invalidate_cache'):
+                self.fade_composite._invalidate_cache()
+            self.fade_composite.repaint()
+        # Also reset and update slider and fade view
         if hasattr(self, 'slider_composite'):
             self.slider_composite.repaint()
+        if hasattr(self, 'fade_composite'):
+            self.fade_composite._invalidate_cache()
+            self.fade_composite.repaint()
 
     def load_pdf_a(self):
         try:
@@ -466,9 +647,12 @@ class PDFDiffViewer(QMainWindow):
         self.show_page_b()
         self.show_diff()
         self.update_page_label()
-        # Also update slider view
+        # Also update slider and fade view
         if hasattr(self, 'slider_composite'):
             self.slider_composite.repaint()
+        if hasattr(self, 'fade_composite'):
+            self.fade_composite._invalidate_cache()
+            self.fade_composite.repaint()
 
     def next_page(self):
         if self.rendererA and self.pageA < self.page_countA - 1:
@@ -480,9 +664,12 @@ class PDFDiffViewer(QMainWindow):
         self.show_page_b()
         self.show_diff()
         self.update_page_label()
-        # Also update slider view
+        # Also update slider and fade view
         if hasattr(self, 'slider_composite'):
             self.slider_composite.repaint()
+        if hasattr(self, 'fade_composite'):
+            self.fade_composite._invalidate_cache()
+            self.fade_composite.repaint()
 
     def compare(self):
         if not (self.rendererA and self.rendererB):
@@ -586,6 +773,14 @@ class PDFDiffViewer(QMainWindow):
                     self.slider_composite._invalidate_cache()
                 self.slider_composite.repaint()
             return
+        # If we're in fade mode, set the temp rect for fade_composite and update view
+        if getattr(self, 'current_mode', 'highlight') == "fade":
+            if hasattr(self, 'fade_composite'):
+                self.fade_composite.fade_temp_diff_rect = (x0, y0, bbox_w, bbox_h)
+                if hasattr(self.fade_composite, '_invalidate_cache'):
+                    self.fade_composite._invalidate_cache()
+                self.fade_composite.repaint()
+            return
 
         # Fallback: highlight mode behavior draws bbox on diff panel (no change)
         try:
@@ -659,6 +854,15 @@ class PDFDiffViewer(QMainWindow):
     def _on_zoom_slider(self, value):
         zoom = value / 100.0
         self.set_zoom(zoom, center=None, update_controls=True)
+        # Ensure slider and fade views update immediately
+        if hasattr(self, 'slider_composite'):
+            if hasattr(self.slider_composite, '_invalidate_cache'):
+                self.slider_composite._invalidate_cache()
+            self.slider_composite.repaint()
+        if hasattr(self, 'fade_composite'):
+            if hasattr(self.fade_composite, '_invalidate_cache'):
+                self.fade_composite._invalidate_cache()
+            self.fade_composite.repaint()
 
     def _on_zoom_input(self):
         try:
@@ -666,6 +870,15 @@ class PDFDiffViewer(QMainWindow):
         except Exception:
             zoom = self.zoom_factor
         self.set_zoom(zoom, center=None, update_controls=True)
+        # Ensure slider and fade views update immediately
+        if hasattr(self, 'slider_composite'):
+            if hasattr(self.slider_composite, '_invalidate_cache'):
+                self.slider_composite._invalidate_cache()
+            self.slider_composite.repaint()
+        if hasattr(self, 'fade_composite'):
+            if hasattr(self.fade_composite, '_invalidate_cache'):
+                self.fade_composite._invalidate_cache()
+            self.fade_composite.repaint()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
