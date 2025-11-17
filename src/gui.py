@@ -525,10 +525,12 @@ class PDFDiffViewer(QMainWindow):
         bboxes = self.diff_bboxes[self.pageA]
         if not bboxes:
             return
-        
+
+        # advance index
         self.current_diff_idx = (self.current_diff_idx + direction) % len(bboxes)
         x, y, w_box, h_box = bboxes[self.current_diff_idx]
 
+        # margin and bbox in image coords
         margin_x = max(int(w_box * 0.05), 5)
         margin_y = max(int(h_box * 0.05), 5)
         x0 = max(0, x - margin_x)
@@ -538,9 +540,11 @@ class PDFDiffViewer(QMainWindow):
         bbox_w = x1 - x0
         bbox_h = y1 - y0
 
+        # source diff image to compute sizes
         diff_img = self.diffs[self.pageA]
         img_h, img_w = diff_img.shape[:2]
 
+        # compute zoom to tightly fit bbox
         label = self.imgA_label
         label_width = label.width() if label.width() > 0 else 350
         label_height = label.height() if label.height() > 0 else 600
@@ -560,23 +564,30 @@ class PDFDiffViewer(QMainWindow):
 
         target_zoom = max(0.1, min(target_zoom, 10.0))
 
+        # center of bbox in image coords
         cx_img = x0 + bbox_w / 2.0
         cy_img = y0 + bbox_h / 2.0
 
+        # compute global pan so bbox center is centered in view
         pan_x = (img_w / 2.0) - cx_img
         pan_y = (img_h / 2.0) - cy_img
 
-        # set global pan
+        # set global pan and apply zoom
         self._pan = [pan_x, pan_y]
-
-        # apply zoom and redraw
         self.set_zoom(target_zoom, center=None, update_controls=True)
-        # For slider mode: set margin-adjusted temp rect and repaint after pan/zoom update
-        if hasattr(self, 'slider_temp_diff_rect'):
-            self.slider_temp_diff_rect = (x0, y0, bbox_w, bbox_h)
-        if hasattr(self, 'slider_composite'):
-            self.slider_composite.repaint()
 
+        # If we're in slider mode, set the temporary rect for the slider composite
+        # and force cache invalidation + repaint. Do NOT try to render the diff panel.
+        if getattr(self, 'current_mode', 'highlight') == "slider":
+            self.slider_temp_diff_rect = (x0, y0, bbox_w, bbox_h)
+            if hasattr(self, 'slider_composite'):
+                # ensure scaled images are recalculated with current pan/zoom
+                if hasattr(self.slider_composite, '_invalidate_cache'):
+                    self.slider_composite._invalidate_cache()
+                self.slider_composite.repaint()
+            return
+
+        # Fallback: highlight mode behavior draws bbox on diff panel (no change)
         try:
             disp = diff_img.copy()
             x0i = int(x0); y0i = int(y0); x1i = int(x1); y1i = int(y1)
@@ -585,6 +596,7 @@ class PDFDiffViewer(QMainWindow):
             pixmap = self.np_to_pixmap(disp_scaled)
             self.diff_label.setPixmap(pixmap)
         except Exception:
+            # keep silent on drawing errors; state already updated
             pass
 
     def show_diff(self):
@@ -675,6 +687,10 @@ class SliderCompositeWidget(QWidget):
         self.setMouseTracking(True)
         self._drag_active = False
         self._last_pos = None
+        # cache structure:
+        # {'key': key, 'qpixA': QPixmap, 'qpixB': QPixmap, 'imgA': np.ndarray, 'imgB': np.ndarray}
+        self._cache = {}
+
     def wheelEvent(self, event):
         delta = event.angleDelta().y()
         if delta == 0:
@@ -692,6 +708,7 @@ class SliderCompositeWidget(QWidget):
         pos = event.position() if hasattr(event, 'position') else event.posF()
         cx, cy = int(pos.x()), int(pos.y())
         viewer.set_zoom(new_zoom, center=(self, (cx, cy)), update_controls=True)
+        self._invalidate_cache()
         self.repaint()
 
     def mousePressEvent(self, event):
@@ -717,6 +734,7 @@ class SliderCompositeWidget(QWidget):
             viewer.show_page_a()
             viewer.show_page_b()
             viewer.show_diff()
+            self._invalidate_cache()
             self.repaint()
             # Clear temp diff rect on user drag
             if hasattr(viewer, 'slider_temp_diff_rect') and viewer.slider_temp_diff_rect is not None:
@@ -739,68 +757,126 @@ class SliderCompositeWidget(QWidget):
         super().leaveEvent(event)
 
     def set_slider_value(self, value):
+        if getattr(self, 'slider_value', None) == value:
+            return
         self.slider_value = value
+        self._invalidate_cache()
         self.repaint()
+
+    def _invalidate_cache(self):
+        self._cache = {}
+
+    def _get_cached_pixmaps(self, viewer):
+        """
+        Return (qpixA, qpixB, imgA_scaled, imgB_scaled)
+        qpix* are QPixmap for fast painting; img*_scaled are the NumPy arrays used for coordinate mapping.
+        """
+        # defensive: ensure renderers exist
+        if not (getattr(viewer, 'rendererA', None) and getattr(viewer, 'rendererB', None)):
+            return None, None, None, None
+
+        key = (
+            viewer.pageA, viewer.pageB, round(viewer.zoom_factor, 6),
+            int(viewer._pan[0]), int(viewer._pan[1]),
+            self.slider_value, self.width(), self.height(), viewer.dpi
+        )
+        cache = self._cache
+        if cache.get('key') == key:
+            return cache['qpixA'], cache['qpixB'], cache['imgA'], cache['imgB']
+
+        # Obtain original rendered pages; prefer viewer.get_rendered_page if present (avoid re-render)
+        if hasattr(viewer, 'get_rendered_page'):
+            srcA = viewer.get_rendered_page(viewer.rendererA, viewer.pageA)
+            srcB = viewer.get_rendered_page(viewer.rendererB, viewer.pageB)
+        else:
+            # fallback (still works, but slower)
+            srcA = viewer.rendererA.render_page(viewer.pageA, dpi=viewer.dpi)
+            srcB = viewer.rendererB.render_page(viewer.pageB, dpi=viewer.dpi)
+
+        if srcA is None or srcB is None:
+            return None, None, None, None
+
+        # Scale to this widget size using viewer.scale_to_label
+        imgA_scaled = viewer.scale_to_label(srcA, self, zoom=viewer.zoom_factor)
+        imgB_scaled = viewer.scale_to_label(srcB, self, zoom=viewer.zoom_factor)
+
+        # Convert scaled NumPy images to QPixmap once and cache
+        qpixA = viewer.np_to_pixmap(imgA_scaled)
+        qpixB = viewer.np_to_pixmap(imgB_scaled)
+
+        # store in cache
+        self._cache = {
+            'key': key,
+            'qpixA': qpixA,
+            'qpixB': qpixB,
+            'imgA': imgA_scaled,
+            'imgB': imgB_scaled
+        }
+        return qpixA, qpixB, imgA_scaled, imgB_scaled
 
     def paintEvent(self, event):
         from PySide6.QtGui import QPainter, QPen, QColor
         viewer = self.parent
         if not (viewer.rendererA and viewer.rendererB):
             return
-        imgA = viewer.rendererA.render_page(viewer.pageA, dpi=viewer.dpi)
-        imgB = viewer.rendererB.render_page(viewer.pageB, dpi=viewer.dpi)
-        # Apply zoom/pan and scale to widget size
-        imgA = viewer.scale_to_label(imgA, self, zoom=viewer.zoom_factor)
-        imgB = viewer.scale_to_label(imgB, self, zoom=viewer.zoom_factor)
-        # Convert to QImage
-        qimgA = viewer.np_to_pixmap(imgA).toImage()
-        qimgB = viewer.np_to_pixmap(imgB).toImage()
+
+        qpixA, qpixB, imgA, imgB = self._get_cached_pixmaps(viewer)
+        if qpixA is None or qpixB is None:
+            return
+
         painter = QPainter(self)
-        # Draw PDF A fully
-        painter.drawImage(0, 0, qimgA)
-        # Clip and draw PDF B according to slider
         w = self.width()
         h = self.height()
+
+        # Draw PDF A fully via QPixmap (fast)
+        painter.drawPixmap(0, 0, qpixA)
+
+        # Clip and draw PDF B according to slider reveal position
         reveal_x = int(w * self.slider_value / 100)
         if reveal_x < w:
             painter.save()
             painter.setClipRect(reveal_x, 0, w - reveal_x, h)
-            painter.drawImage(0, 0, qimgB)
+            painter.drawPixmap(0, 0, qpixB)
             painter.restore()
-        # Draw diff rectangles only in highlight mode
-        if hasattr(viewer, 'current_mode') and viewer.current_mode == "highlight":
+
+        # Draw diff rectangles only in highlight mode (map bbox from image coords using scaled images)
+        if getattr(viewer, 'current_mode', 'highlight') == "highlight":
             if viewer.diff_bboxes and viewer.pageA < len(viewer.diff_bboxes):
                 bboxes = viewer.diff_bboxes[viewer.pageA]
-                for idx, (x, y, bw, bh) in enumerate(bboxes):
-                    # Transform bbox to widget coordinates
+                # avoid zero-dimension scaled images
+                if imgA is not None and imgA.shape[1] and imgA.shape[0]:
                     img_h, img_w = imgA.shape[:2]
-                    scale_x = w / img_w
-                    scale_y = h / img_h
-                    rect_x = int(x * scale_x)
-                    rect_y = int(y * scale_y)
-                    rect_w = int(bw * scale_x)
-                    rect_h = int(bh * scale_y)
-                    pen = QPen(QColor(255, 0, 0), 2)
-                    painter.setPen(pen)
-                    painter.drawRect(rect_x, rect_y, rect_w, rect_h)
-        # Draw temp diff rectangle overlay in slider mode if set
-        rect = getattr(viewer, 'slider_temp_diff_rect', None)
-        if rect is not None and hasattr(viewer, 'current_mode') and viewer.current_mode == "slider":
-            x, y, bw, bh = rect
-            img_h, img_w = imgA.shape[:2]
-            scale_x = w / img_w
-            scale_y = h / img_h
-            rect_x = int(x * scale_x)
-            rect_y = int(y * scale_y)
-            rect_w = int(bw * scale_x)
-            rect_h = int(bh * scale_y)
-            pen = QPen(QColor(255, 0, 0), 3)
-            pen.setStyle(Qt.SolidLine)
-            painter.setPen(pen)
-            painter.setBrush(Qt.NoBrush)
-            painter.drawRect(rect_x, rect_y, rect_w, rect_h)
-        painter.end()
+                    for (x, y, bw, bh) in bboxes:
+                        # Map image coords -> widget coords
+                        scale_x = w / img_w
+                        scale_y = h / img_h
+                        rect_x = int(x * scale_x)
+                        rect_y = int(y * scale_y)
+                        rect_w = int(bw * scale_x)
+                        rect_h = int(bh * scale_y)
+                        pen = QPen(QColor(255, 0, 0), 2)
+                        painter.setPen(pen)
+                        painter.setBrush(Qt.NoBrush)
+                        painter.drawRect(rect_x, rect_y, rect_w, rect_h)
 
+        # In slider mode draw temporary diff rect if present (mapped same way)
+        rect = getattr(viewer, 'slider_temp_diff_rect', None)
+        if rect is not None and getattr(viewer, 'current_mode', 'highlight') == "slider":
+            x, y, bw, bh = rect
+            if imgA is not None and imgA.shape[1] and imgA.shape[0]:
+                img_h, img_w = imgA.shape[:2]
+                scale_x = w / img_w
+                scale_y = h / img_h
+                rect_x = int(x * scale_x)
+                rect_y = int(y * scale_y)
+                rect_w = int(bw * scale_x)
+                rect_h = int(bh * scale_y)
+                pen = QPen(QColor(255, 0, 0), 3)
+                painter.setPen(pen)
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRect(rect_x, rect_y, rect_w, rect_h)
+
+        painter.end()
 
 # Custom QLabel to handle wheel events for zoom & drag panning
 class ZoomLabel(QLabel):
