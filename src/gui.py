@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QFileDialog, QLabel, QSlider, QMessageBox,
     QLineEdit, QToolBar, QSizePolicy, QToolButton, QMenu
 )
-from PySide6.QtGui import QShortcut, QKeySequence, QAction
+from PySide6.QtGui import QShortcut, QKeySequence, QAction, QActionGroup
 from PySide6.QtCore import Qt, QThread
 
 import numpy as np
@@ -25,6 +25,11 @@ logging.basicConfig(level=logging.INFO)
 
 
 class PDFDiffViewer(QMainWindow):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.current_mode = "highlight"
+        self.slider_temp_diff_rect = None  # (x, y, w, h) in image coords for slider highlight
+        # ...existing code...
     @staticmethod
     def overlay_mask(img: np.ndarray, mask: np.ndarray) -> np.ndarray:
         """
@@ -189,12 +194,19 @@ class PDFDiffViewer(QMainWindow):
 
         # View menu
         view_menu = QMenu("View", self)
+        self.mode_group = QActionGroup(self)
+        self.action_highlight_view = QAction("Highlight", self, checkable=True, checked=True)
+        self.action_slider_view = QAction("Slider", self, checkable=True)
+        self.mode_group.setExclusive(True)
+        self.mode_group.addAction(self.action_highlight_view)
+        self.mode_group.addAction(self.action_slider_view)
         self.action_next_diff = QAction("Next Diff", self, toolTip="Next Diff (Alt+→)")
         self.action_prev_diff = QAction("Previous Diff", self, toolTip="Previous Diff (Alt+←)")
         self.action_reset_view = QAction("Reset View", self, toolTip="Reset View (Ctrl+↓)")
+        view_menu.addActions(self.mode_group.actions())
+        view_menu.addSeparator()
         view_menu.addAction(self.action_next_diff)
         view_menu.addAction(self.action_prev_diff)
-        view_menu.addSeparator()
         view_menu.addAction(self.action_reset_view)
         view_button = QToolButton()
         view_button.setText("View")
@@ -211,30 +223,53 @@ class PDFDiffViewer(QMainWindow):
         toolbar.addAction(self.action_prev)
         toolbar.addAction(self.action_next)
 
-        # Three-panel layout
-        img_layout = QHBoxLayout()
+        # --- Highlight View Container (three-panel layout) ---
+        self.highlight_view_container = QWidget()
+        img_layout = QHBoxLayout(self.highlight_view_container)
+        img_layout.setContentsMargins(0, 0, 0, 0)
         self.imgA_label = ZoomLabel("PDF A", self, 'A')
         self.imgA_label.setAlignment(Qt.AlignCenter)
         self.imgA_label.setStyleSheet("background: #eee; border: 1px solid #ccc;")
         self.imgA_label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Minimum)
         self.imgA_label.setMinimumSize(350, 600)
-
         self.imgB_label = ZoomLabel("PDF B", self, 'B')
         self.imgB_label.setAlignment(Qt.AlignCenter)
         self.imgB_label.setStyleSheet("background: #eee; border: 1px solid #ccc;")
         self.imgB_label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Minimum)
         self.imgB_label.setMinimumSize(350, 600)
-
         self.diff_label = ZoomLabel("Diff", self, 'D')
         self.diff_label.setAlignment(Qt.AlignCenter)
         self.diff_label.setStyleSheet("background: #eee; border: 1px solid #ccc;")
         self.diff_label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Minimum)
         self.diff_label.setMinimumSize(350, 600)
-
         img_layout.addWidget(self.imgA_label, stretch=1)
         img_layout.addWidget(self.imgB_label, stretch=1)
         img_layout.addWidget(self.diff_label, stretch=1)
-        main_layout.addLayout(img_layout)
+
+        # --- Slider View Container (single composite widget) ---
+        self.slider_view_container = QWidget()
+        slider_layout = QVBoxLayout(self.slider_view_container)
+        slider_layout.setContentsMargins(0, 0, 0, 0)
+        self.slider_composite = SliderCompositeWidget(self)
+        slider_layout.addWidget(self.slider_composite)
+
+        # --- QStackedWidget to switch between highlight and slider views ---
+        from PySide6.QtWidgets import QStackedWidget
+        self.stacked_widget = QStackedWidget()
+        self.stacked_widget.addWidget(self.highlight_view_container)  # index 0
+        self.stacked_widget.addWidget(self.slider_view_container)     # index 1
+        main_layout.addWidget(self.stacked_widget)
+
+        # Slider for slider view (controls reveal boundary)
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setMinimum(0)
+        self.slider.setMaximum(100)
+        self.slider.setValue(50)
+        self.slider.setTickInterval(1)
+        self.slider.setSingleStep(1)
+        self.slider.valueChanged.connect(self.slider_composite.set_slider_value)
+        self.slider.hide()
+        main_layout.addWidget(self.slider)
 
         # Bottom bar
         bottom_bar = QHBoxLayout()
@@ -285,12 +320,24 @@ class PDFDiffViewer(QMainWindow):
         self.action_next_diff.triggered.connect(lambda: self.goto_diff(1))
         self.action_prev_diff.triggered.connect(lambda: self.goto_diff(-1))
         self.action_reset_view.triggered.connect(self.reset_view)
+        self.action_highlight_view.triggered.connect(lambda: self.change_view_mode("highlight"))
+        self.action_slider_view.triggered.connect(lambda: self.change_view_mode("slider"))
 
         QShortcut(QKeySequence("Ctrl+Right"), self, self.next_page)
         QShortcut(QKeySequence("Ctrl+Left"), self, self.prev_page)
         QShortcut(QKeySequence("Ctrl+Down"), self, self.reset_view)
         QShortcut(QKeySequence("Alt+Right"), self, lambda: self.goto_diff(1))
         QShortcut(QKeySequence("Alt+Left"), self, lambda: self.goto_diff(-1))
+
+    def change_view_mode(self, mode):
+        self.current_mode = mode
+        if mode == "highlight":
+            self.stacked_widget.setCurrentIndex(0)
+            self.slider.hide()
+        elif mode == "slider":
+            self.stacked_widget.setCurrentIndex(1)
+            self.slider.show()
+        self.slider_composite.repaint()
 
     def export_compared_pdf(self):
         if not self.diffs:
@@ -301,8 +348,6 @@ class PDFDiffViewer(QMainWindow):
             if not path:
                 return
             import fitz  # PyMuPDF
-            import cv2
-            import numpy as np
             doc = fitz.open()
             for img in self.diffs:
                 if img.ndim == 2:
@@ -349,6 +394,9 @@ class PDFDiffViewer(QMainWindow):
         self.show_page_a()
         self.show_page_b()
         self.show_diff()
+        # Also reset and update slider view
+        if hasattr(self, 'slider_composite'):
+            self.slider_composite.repaint()
 
     def load_pdf_a(self):
         try:
@@ -418,6 +466,9 @@ class PDFDiffViewer(QMainWindow):
         self.show_page_b()
         self.show_diff()
         self.update_page_label()
+        # Also update slider view
+        if hasattr(self, 'slider_composite'):
+            self.slider_composite.repaint()
 
     def next_page(self):
         if self.rendererA and self.pageA < self.page_countA - 1:
@@ -429,6 +480,9 @@ class PDFDiffViewer(QMainWindow):
         self.show_page_b()
         self.show_diff()
         self.update_page_label()
+        # Also update slider view
+        if hasattr(self, 'slider_composite'):
+            self.slider_composite.repaint()
 
     def compare(self):
         if not (self.rendererA and self.rendererB):
@@ -471,6 +525,7 @@ class PDFDiffViewer(QMainWindow):
         bboxes = self.diff_bboxes[self.pageA]
         if not bboxes:
             return
+        
         self.current_diff_idx = (self.current_diff_idx + direction) % len(bboxes)
         x, y, w_box, h_box = bboxes[self.current_diff_idx]
 
@@ -516,6 +571,11 @@ class PDFDiffViewer(QMainWindow):
 
         # apply zoom and redraw
         self.set_zoom(target_zoom, center=None, update_controls=True)
+        # For slider mode: set margin-adjusted temp rect and repaint after pan/zoom update
+        if hasattr(self, 'slider_temp_diff_rect'):
+            self.slider_temp_diff_rect = (x0, y0, bbox_w, bbox_h)
+        if hasattr(self, 'slider_composite'):
+            self.slider_composite.repaint()
 
         try:
             disp = diff_img.copy()
@@ -544,7 +604,11 @@ class PDFDiffViewer(QMainWindow):
         if center is not None:
             # center is expected to be tuple (label, (x,y)) or None.
             # For backward compatibility accept (x,y) as label-local coords on active label.
-            if isinstance(center, tuple) and len(center) == 2 and isinstance(center[0], QLabel):
+            if (
+                isinstance(center, tuple)
+                and len(center) == 2
+                and isinstance(center[0], QWidget)
+            ):
                 label, (cx, cy) = center
                 # Convert center from label-local to image-space and update self._pan
                 self._adjust_global_pan_from_label_center(label, (cx, cy), old_zoom, self.zoom_factor)
@@ -598,6 +662,148 @@ class PDFDiffViewer(QMainWindow):
             h = self.height()
             self.spinner.move(w // 2 - self.spinner.width() // 2,
                               h // 2 - self.spinner.height() // 2)
+            
+            
+
+class SliderCompositeWidget(QWidget):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent = parent
+        self.slider_value = 50  # 0 = all A, 100 = all B
+        self.setMinimumSize(350, 600)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMouseTracking(True)
+        self._drag_active = False
+        self._last_pos = None
+    def wheelEvent(self, event):
+        # Hide temp diff rect on zoom
+        if hasattr(self.parent, 'slider_temp_diff_rect') and self.parent.slider_temp_diff_rect is not None:
+            self.parent.slider_temp_diff_rect = None
+            self.repaint()
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+        viewer = self.parent
+        zoom_step = 1.25
+        old_zoom = viewer.zoom_factor
+        if delta > 0:
+            new_zoom = min(old_zoom * zoom_step, 10.0)
+        else:
+            new_zoom = max(old_zoom / zoom_step, 0.1)
+        if abs(new_zoom - old_zoom) < 1e-6:
+            return
+        # Use mouse position as zoom center
+        pos = event.position() if hasattr(event, 'position') else event.posF()
+        cx, cy = int(pos.x()), int(pos.y())
+        viewer.set_zoom(new_zoom, center=(self, (cx, cy)), update_controls=True)
+        self.repaint()
+
+    def mousePressEvent(self, event):
+        # Hide temp diff rect on mouse press
+        if hasattr(self.parent, 'slider_temp_diff_rect') and self.parent.slider_temp_diff_rect is not None:
+            self.parent.slider_temp_diff_rect = None
+            self.repaint()
+        if event.button() == Qt.LeftButton:
+            self._drag_active = True
+            self._last_pos = event.pos()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        # Hide temp diff rect on mouse move (drag)
+        if hasattr(self.parent, 'slider_temp_diff_rect') and self.parent.slider_temp_diff_rect is not None:
+            self.parent.slider_temp_diff_rect = None
+            self.repaint()
+        viewer = self.parent
+        if (event.buttons() & Qt.LeftButton) and self._drag_active and self._last_pos is not None:
+            delta = event.pos() - self._last_pos
+            self._last_pos = event.pos()
+            speed = 2.0
+            dx = int(delta.x() * speed / max(viewer.zoom_factor, 1e-6))
+            dy = int(delta.y() * speed / max(viewer.zoom_factor, 1e-6))
+            viewer._pan[0] += dx
+            viewer._pan[1] += dy
+            viewer.show_page_a()
+            viewer.show_page_b()
+            viewer.show_diff()
+            self.repaint()
+        else:
+            self._drag_active = False
+            self._last_pos = None
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_active = False
+            self._last_pos = None
+        super().mouseReleaseEvent(event)
+
+    def leaveEvent(self, event):
+        self._drag_active = False
+        self._last_pos = None
+        super().leaveEvent(event)
+
+    def set_slider_value(self, value):
+        self.slider_value = value
+        self.repaint()
+
+    def paintEvent(self, event):
+        from PySide6.QtGui import QPainter, QPen, QColor
+        viewer = self.parent
+        if not (viewer.rendererA and viewer.rendererB):
+            return
+        imgA = viewer.rendererA.render_page(viewer.pageA, dpi=viewer.dpi)
+        imgB = viewer.rendererB.render_page(viewer.pageB, dpi=viewer.dpi)
+        # Apply zoom/pan and scale to widget size
+        imgA = viewer.scale_to_label(imgA, self, zoom=viewer.zoom_factor)
+        imgB = viewer.scale_to_label(imgB, self, zoom=viewer.zoom_factor)
+        # Convert to QImage
+        qimgA = viewer.np_to_pixmap(imgA).toImage()
+        qimgB = viewer.np_to_pixmap(imgB).toImage()
+        painter = QPainter(self)
+        # Draw PDF A fully
+        painter.drawImage(0, 0, qimgA)
+        # Clip and draw PDF B according to slider
+        w = self.width()
+        h = self.height()
+        reveal_x = int(w * self.slider_value / 100)
+        if reveal_x < w:
+            painter.save()
+            painter.setClipRect(reveal_x, 0, w - reveal_x, h)
+            painter.drawImage(0, 0, qimgB)
+            painter.restore()
+        # Draw diff rectangles only in highlight mode
+        if hasattr(viewer, 'current_mode') and viewer.current_mode == "highlight":
+            if viewer.diff_bboxes and viewer.pageA < len(viewer.diff_bboxes):
+                bboxes = viewer.diff_bboxes[viewer.pageA]
+                for idx, (x, y, bw, bh) in enumerate(bboxes):
+                    # Transform bbox to widget coordinates
+                    img_h, img_w = imgA.shape[:2]
+                    scale_x = w / img_w
+                    scale_y = h / img_h
+                    rect_x = int(x * scale_x)
+                    rect_y = int(y * scale_y)
+                    rect_w = int(bw * scale_x)
+                    rect_h = int(bh * scale_y)
+                    pen = QPen(QColor(255, 0, 0), 2)
+                    painter.setPen(pen)
+                    painter.drawRect(rect_x, rect_y, rect_w, rect_h)
+        # Draw temp diff rectangle overlay in slider mode if set
+        rect = getattr(viewer, 'slider_temp_diff_rect', None)
+        if rect is not None and hasattr(viewer, 'current_mode') and viewer.current_mode == "slider":
+            x, y, bw, bh = rect
+            img_h, img_w = imgA.shape[:2]
+            scale_x = w / img_w
+            scale_y = h / img_h
+            rect_x = int(x * scale_x)
+            rect_y = int(y * scale_y)
+            rect_w = int(bw * scale_x)
+            rect_h = int(bh * scale_y)
+            pen = QPen(QColor(255, 0, 0), 3)
+            pen.setStyle(Qt.SolidLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(rect_x, rect_y, rect_w, rect_h)
+        painter.end()
 
 
 # Custom QLabel to handle wheel events for zoom & drag panning
