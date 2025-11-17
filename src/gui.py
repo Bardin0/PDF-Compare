@@ -121,7 +121,7 @@ class PDFDiffViewer(QMainWindow):
         super().__init__()
         self.setWindowTitle("PDF Image Diff Viewer")
         self.resize(1200, 800)  # Initial size, but resizable
-        self.setMinimumSize(800, 600)
+        self.setMinimumSize(1000, 600)
         self._init_ui()
         self.rendererA = None
         self.rendererB = None
@@ -205,17 +205,20 @@ class PDFDiffViewer(QMainWindow):
         self.imgA_label = ZoomLabel("PDF A", self, 'A')
         self.imgA_label.setAlignment(Qt.AlignCenter)
         self.imgA_label.setStyleSheet("background: #eee; border: 1px solid #ccc;")
-        self.imgA_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.imgA_label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Minimum)
+        self.imgA_label.setMinimumSize(350, 600)
 
         self.imgB_label = ZoomLabel("PDF B", self, 'B')
         self.imgB_label.setAlignment(Qt.AlignCenter)
         self.imgB_label.setStyleSheet("background: #eee; border: 1px solid #ccc;")
-        self.imgB_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.imgB_label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Minimum)
+        self.imgB_label.setMinimumSize(350, 600)
 
         self.diff_label = ZoomLabel("Diff", self, 'D')
         self.diff_label.setAlignment(Qt.AlignCenter)
         self.diff_label.setStyleSheet("background: #eee; border: 1px solid #ccc;")
-        self.diff_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.diff_label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Minimum)
+        self.diff_label.setMinimumSize(350, 600)
 
         img_layout.addWidget(self.imgA_label, stretch=1)
         img_layout.addWidget(self.imgB_label, stretch=1)
@@ -470,7 +473,6 @@ class PDFDiffViewer(QMainWindow):
         self.spinner.stop()
         QMessageBox.critical(self, "Error", msg)
 
-
     def goto_diff(self, direction=1):
         """
         Navigate to the next/previous diff region on the current page, zooming to fit tightly.
@@ -600,7 +602,6 @@ class PDFDiffViewer(QMainWindow):
             self.spinner.move(w // 2 - self.spinner.width() // 2,
                             h // 2 - self.spinner.height() // 2)
 
-
 # Custom QLabel to handle wheel events for zoom
 class ZoomLabel(QLabel):
     def __init__(self, text, parent, which):
@@ -682,6 +683,13 @@ class ZoomLabel(QLabel):
         self.parent.show_diff()
 
     def mousePressEvent(self, event):
+
+        if event.button() == Qt.LeftButton and self.which in ['A', 'B']:
+            if self.which == 'A' and not self.parent.rendererA:
+                self.parent.load_pdf_a()
+            elif self.which == 'B' and not self.parent.rendererB:
+                self.parent.load_pdf_b()
+
         if event.button() == Qt.LeftButton:
             self._drag_active = True
             self._last_pos = event.pos()
@@ -733,7 +741,6 @@ class ZoomLabel(QLabel):
         yellow_bgr = np.array([0, 255, 255], dtype=np.uint8)
         overlay[mask > 0] = yellow_bgr
         return overlay
-
 
 def main():
     app = QApplication(sys.argv)
