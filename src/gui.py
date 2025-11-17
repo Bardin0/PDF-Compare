@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QFileDialog, QLabel, QSlider, QMessageBox,
     QLineEdit, QToolBar, QSizePolicy, QToolButton, QMenu
 )
-from PySide6.QtGui import QShortcut, QKeySequence, QAction, QActionGroup
+from PySide6.QtGui import QShortcut, QKeySequence, QAction, QActionGroup, QPainter
 from PySide6.QtCore import Qt, QThread
 
 import numpy as np
@@ -22,136 +22,6 @@ from src.diff_engine import DiffEngine
 from src.spinner import LoadingSpinner
 
 logging.basicConfig(level=logging.INFO)
-
-# --- FadeCompositeWidget for fade mode ---
-class FadeCompositeWidget(QWidget):
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.parent = parent
-        self.fade_value = 50
-        self._cache = {}
-        self.fade_temp_diff_rect = None
-
-    def wheelEvent(self, event):
-        # Zoom in/out on wheel
-        viewer = self.parent
-        delta = event.angleDelta().y()
-        if delta == 0:
-            return
-        zoom_step = 1.25
-        old_zoom = viewer.zoom_factor
-        if delta > 0:
-            new_zoom = min(old_zoom * zoom_step, 10.0)
-        else:
-            new_zoom = max(old_zoom / zoom_step, 0.1)
-        if abs(new_zoom - old_zoom) < 1e-6:
-            return
-        # Use mouse position as zoom center
-        pos = event.position() if hasattr(event, 'position') else event.posF()
-        cx, cy = int(pos.x()), int(pos.y())
-        viewer.set_zoom(new_zoom, center=(self, (cx, cy)), update_controls=True)
-        self._invalidate_cache()
-        self.repaint()
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self._drag_active = True
-            self._last_pos = event.pos()
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        viewer = self.parent
-        if (event.buttons() & Qt.LeftButton) and getattr(self, '_drag_active', False) and getattr(self, '_last_pos', None) is not None:
-            delta = event.pos() - self._last_pos
-            self._last_pos = event.pos()
-            speed = 2.0
-            dx = int(delta.x() * speed / max(viewer.zoom_factor, 1e-6))
-            dy = int(delta.y() * speed / max(viewer.zoom_factor, 1e-6))
-            viewer._pan[0] += dx
-            viewer._pan[1] += dy
-            viewer.show_page_a()
-            viewer.show_page_b()
-            viewer.show_diff()
-            self._invalidate_cache()
-            self.repaint()
-        else:
-            self._drag_active = False
-            self._last_pos = None
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self._drag_active = False
-            self._last_pos = None
-        super().mouseReleaseEvent(event)
-
-    def leaveEvent(self, event):
-        self._drag_active = False
-        self._last_pos = None
-        super().leaveEvent(event)
-
-    def set_fade_value(self, value):
-        if getattr(self, 'fade_value', None) == value:
-            return
-        self.fade_value = value
-        self.repaint()
-
-    def _invalidate_cache(self):
-        self._cache = {}
-
-    def _get_cached_images(self, viewer):
-        key = (
-            viewer.pageA, viewer.pageB, viewer.zoom_factor,
-            tuple(getattr(viewer, '_pan', [0.0, 0.0])),
-            self.width(), self.height()
-        )
-        cache = getattr(self, '_cache', {})
-        if cache.get('key') == key:
-            return cache['qimgA'], cache['qimgB'], cache['imgA'], cache['imgB']
-        imgA = viewer.rendererA.render_page(viewer.pageA, dpi=viewer.dpi)
-        imgB = viewer.rendererB.render_page(viewer.pageB, dpi=viewer.dpi)
-        imgA_scaled = viewer.scale_to_label(imgA, self, zoom=viewer.zoom_factor)
-        imgB_scaled = viewer.scale_to_label(imgB, self, zoom=viewer.zoom_factor)
-        qimgA = viewer.np_to_pixmap(imgA_scaled).toImage()
-        qimgB = viewer.np_to_pixmap(imgB_scaled).toImage()
-        self._cache = {'key': key, 'qimgA': qimgA, 'qimgB': qimgB, 'imgA': imgA_scaled, 'imgB': imgB_scaled}
-        return qimgA, qimgB, imgA_scaled, imgB_scaled
-
-    def paintEvent(self, event):
-        from PySide6.QtGui import QPainter, QPen, QColor
-        viewer = self.parent
-        if not (viewer.rendererA and viewer.rendererB):
-            return
-        qimgA, qimgB, imgA, imgB = self._get_cached_images(viewer)
-        painter = QPainter(self)
-        w = self.width()
-        h = self.height()
-        alpha_b = self.fade_value / 100.0
-        alpha_a = 1.0 - alpha_b
-        # Draw A with alpha_a
-        painter.setOpacity(alpha_a)
-        painter.drawImage(0, 0, qimgA)
-        # Draw B with alpha_b
-        painter.setOpacity(alpha_b)
-        painter.drawImage(0, 0, qimgB)
-        painter.setOpacity(1.0)
-        # Draw temp diff rectangle if set
-        rect = getattr(viewer, 'fade_temp_diff_rect', None)
-        if rect is not None:
-            x, y, bw, bh = rect
-            img_h, img_w = imgA.shape[:2]
-            scale_x = w / img_w
-            scale_y = h / img_h
-            rect_x = int(x * scale_x)
-            rect_y = int(y * scale_y)
-            rect_w = int(bw * scale_x)
-            rect_h = int(bh * scale_y)
-            pen = QPen(QColor(255, 0, 0), 3)
-            pen.setStyle(Qt.SolidLine)
-            painter.setPen(pen)
-            painter.setBrush(Qt.NoBrush)
-            painter.drawRect(rect_x, rect_y, rect_w, rect_h)
-        painter.end()
 
 class PDFDiffViewer(QMainWindow):
     def __init__(self, *args, **kwargs):
@@ -888,8 +758,6 @@ class PDFDiffViewer(QMainWindow):
             self.spinner.move(w // 2 - self.spinner.width() // 2,
                               h // 2 - self.spinner.height() // 2)
             
-            
-
 class SliderCompositeWidget(QWidget):
     def __init__(self, parent):
         super().__init__(parent)
@@ -1028,12 +896,11 @@ class SliderCompositeWidget(QWidget):
         return qpixA, qpixB, imgA_scaled, imgB_scaled
 
     def paintEvent(self, event):
-        from PySide6.QtGui import QPainter, QPen, QColor
         viewer = self.parent
         if not (viewer.rendererA and viewer.rendererB):
             return
 
-        qpixA, qpixB, imgA, imgB = self._get_cached_pixmaps(viewer)
+        qpixA, qpixB,_,_ = self._get_cached_pixmaps(viewer)
         if qpixA is None or qpixB is None:
             return
 
@@ -1051,43 +918,6 @@ class SliderCompositeWidget(QWidget):
             painter.setClipRect(reveal_x, 0, w - reveal_x, h)
             painter.drawPixmap(0, 0, qpixB)
             painter.restore()
-
-        # Draw diff rectangles only in highlight mode (map bbox from image coords using scaled images)
-        if getattr(viewer, 'current_mode', 'highlight') == "highlight":
-            if viewer.diff_bboxes and viewer.pageA < len(viewer.diff_bboxes):
-                bboxes = viewer.diff_bboxes[viewer.pageA]
-                # avoid zero-dimension scaled images
-                if imgA is not None and imgA.shape[1] and imgA.shape[0]:
-                    img_h, img_w = imgA.shape[:2]
-                    for (x, y, bw, bh) in bboxes:
-                        # Map image coords -> widget coords
-                        scale_x = w / img_w
-                        scale_y = h / img_h
-                        rect_x = int(x * scale_x)
-                        rect_y = int(y * scale_y)
-                        rect_w = int(bw * scale_x)
-                        rect_h = int(bh * scale_y)
-                        pen = QPen(QColor(255, 0, 0), 2)
-                        painter.setPen(pen)
-                        painter.setBrush(Qt.NoBrush)
-                        painter.drawRect(rect_x, rect_y, rect_w, rect_h)
-
-        # In slider mode draw temporary diff rect if present (mapped same way)
-        rect = getattr(viewer, 'slider_temp_diff_rect', None)
-        if rect is not None and getattr(viewer, 'current_mode', 'highlight') == "slider":
-            x, y, bw, bh = rect
-            if imgA is not None and imgA.shape[1] and imgA.shape[0]:
-                img_h, img_w = imgA.shape[:2]
-                scale_x = w / img_w
-                scale_y = h / img_h
-                rect_x = int(x * scale_x)
-                rect_y = int(y * scale_y)
-                rect_w = int(bw * scale_x)
-                rect_h = int(bh * scale_y)
-                pen = QPen(QColor(255, 0, 0), 3)
-                painter.setPen(pen)
-                painter.setBrush(Qt.NoBrush)
-                painter.drawRect(rect_x, rect_y, rect_w, rect_h)
 
         painter.end()
 
@@ -1192,6 +1022,135 @@ class ZoomLabel(QLabel):
         overlay[mask > 0] = yellow_bgr
         return overlay
 
+# --- FadeCompositeWidget for fade mode ---
+class FadeCompositeWidget(QWidget):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent = parent
+        self.fade_value = 50
+        self._cache = {}
+        self.fade_temp_diff_rect = None
+
+    def wheelEvent(self, event):
+        # Zoom in/out on wheel
+        viewer = self.parent
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+        zoom_step = 1.25
+        old_zoom = viewer.zoom_factor
+        if delta > 0:
+            new_zoom = min(old_zoom * zoom_step, 10.0)
+        else:
+            new_zoom = max(old_zoom / zoom_step, 0.1)
+        if abs(new_zoom - old_zoom) < 1e-6:
+            return
+        # Use mouse position as zoom center
+        pos = event.position() if hasattr(event, 'position') else event.posF()
+        cx, cy = int(pos.x()), int(pos.y())
+        viewer.set_zoom(new_zoom, center=(self, (cx, cy)), update_controls=True)
+        self._invalidate_cache()
+        self.repaint()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_active = True
+            self._last_pos = event.pos()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        viewer = self.parent
+        if (event.buttons() & Qt.LeftButton) and getattr(self, '_drag_active', False) and getattr(self, '_last_pos', None) is not None:
+            delta = event.pos() - self._last_pos
+            self._last_pos = event.pos()
+            speed = 2.0
+            dx = int(delta.x() * speed / max(viewer.zoom_factor, 1e-6))
+            dy = int(delta.y() * speed / max(viewer.zoom_factor, 1e-6))
+            viewer._pan[0] += dx
+            viewer._pan[1] += dy
+            viewer.show_page_a()
+            viewer.show_page_b()
+            viewer.show_diff()
+            self._invalidate_cache()
+            self.repaint()
+        else:
+            self._drag_active = False
+            self._last_pos = None
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_active = False
+            self._last_pos = None
+        super().mouseReleaseEvent(event)
+
+    def leaveEvent(self, event):
+        self._drag_active = False
+        self._last_pos = None
+        super().leaveEvent(event)
+
+    def set_fade_value(self, value):
+        if getattr(self, 'fade_value', None) == value:
+            return
+        self.fade_value = value
+        self.repaint()
+
+    def _invalidate_cache(self):
+        self._cache = {}
+
+    def _get_cached_images(self, viewer):
+        key = (
+            viewer.pageA, viewer.pageB, viewer.zoom_factor,
+            tuple(getattr(viewer, '_pan', [0.0, 0.0])),
+            self.width(), self.height()
+        )
+        cache = getattr(self, '_cache', {})
+        if cache.get('key') == key:
+            return cache['qimgA'], cache['qimgB'], cache['imgA'], cache['imgB']
+        imgA = viewer.rendererA.render_page(viewer.pageA, dpi=viewer.dpi)
+        imgB = viewer.rendererB.render_page(viewer.pageB, dpi=viewer.dpi)
+        imgA_scaled = viewer.scale_to_label(imgA, self, zoom=viewer.zoom_factor)
+        imgB_scaled = viewer.scale_to_label(imgB, self, zoom=viewer.zoom_factor)
+        qimgA = viewer.np_to_pixmap(imgA_scaled).toImage()
+        qimgB = viewer.np_to_pixmap(imgB_scaled).toImage()
+        self._cache = {'key': key, 'qimgA': qimgA, 'qimgB': qimgB, 'imgA': imgA_scaled, 'imgB': imgB_scaled}
+        return qimgA, qimgB, imgA_scaled, imgB_scaled
+
+    def paintEvent(self, event):
+        from PySide6.QtGui import QPainter, QPen, QColor
+        viewer = self.parent
+        if not (viewer.rendererA and viewer.rendererB):
+            return
+        qimgA, qimgB, imgA, imgB = self._get_cached_images(viewer)
+        painter = QPainter(self)
+        w = self.width()
+        h = self.height()
+        alpha_b = self.fade_value / 100.0
+        alpha_a = 1.0 - alpha_b
+        # Draw A with alpha_a
+        painter.setOpacity(alpha_a)
+        painter.drawImage(0, 0, qimgA)
+        # Draw B with alpha_b
+        painter.setOpacity(alpha_b)
+        painter.drawImage(0, 0, qimgB)
+        painter.setOpacity(1.0)
+        # Draw temp diff rectangle if set
+        rect = getattr(viewer, 'fade_temp_diff_rect', None)
+        if rect is not None:
+            x, y, bw, bh = rect
+            img_h, img_w = imgA.shape[:2]
+            scale_x = w / img_w
+            scale_y = h / img_h
+            rect_x = int(x * scale_x)
+            rect_y = int(y * scale_y)
+            rect_w = int(bw * scale_x)
+            rect_h = int(bh * scale_y)
+            pen = QPen(QColor(255, 0, 0), 3)
+            pen.setStyle(Qt.SolidLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(rect_x, rect_y, rect_w, rect_h)
+        painter.end()
 
 def main():
     app = QApplication(sys.argv)
