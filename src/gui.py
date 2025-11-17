@@ -10,13 +10,15 @@ from PySide6.QtWidgets import (
     QLineEdit, QToolBar, QSizePolicy, QToolButton, QMenu
 )
 from PySide6.QtGui import QShortcut, QKeySequence, QAction
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread
+
 import numpy as np
 import cv2
 import logging
 from src.renderer import PDFRenderer
 from src.register import PageRegister
 from src.diff_engine import DiffEngine
+from src.spinner import LoadingSpinner
 
 logging.basicConfig(level=logging.INFO)
 
@@ -130,7 +132,7 @@ class PDFDiffViewer(QMainWindow):
         self.dpi = 150
         self.zoom_factor = 1.0  # Initial zoom factor
         self.register = PageRegister()
-        self.diff_engine = DiffEngine()
+        self.diff_engine = DiffEngine()   
         self.diffs = []  # Store computed diffs for all pages
         self.diff_bboxes = []  # bounding boxes per page
         self.current_diff_idx = 0
@@ -176,9 +178,9 @@ class PDFDiffViewer(QMainWindow):
 
         # View menu as QToolButton
         view_menu = QMenu("View", self)
-        self.action_next_diff = QAction("Next Diff (Alt+→)", self)
-        self.action_prev_diff = QAction("Previous Diff (Alt+←)", self)
-        self.action_reset_view = QAction("Reset View (Alt+↓)", self)
+        self.action_next_diff = QAction("Next Diff", self, toolTip="Next Diff (Alt+→)")
+        self.action_prev_diff = QAction("Previous Diff", self, toolTip="Previous Diff (Alt+←)")
+        self.action_reset_view = QAction("Reset View", self, toolTip="Reset View (Ctrl+↓)")
         view_menu.addAction(self.action_next_diff)
         view_menu.addAction(self.action_prev_diff)
         view_menu.addSeparator()
@@ -192,8 +194,8 @@ class PDFDiffViewer(QMainWindow):
 
         # Navigation/compare actions as toolbar buttons
         self.action_compare = QAction("Compare", self)
-        self.action_prev = QAction("Previous Page (Ctrl+←)", self)
-        self.action_next = QAction("Next Page (Ctrl+→)", self)
+        self.action_prev = QAction("Previous Page", self, toolTip="Previous Page (Ctrl+←)")
+        self.action_next = QAction("Next Page", self, toolTip="Next Page (Ctrl+→)")
         toolbar.addAction(self.action_compare)
         toolbar.addAction(self.action_prev)
         toolbar.addAction(self.action_next)
@@ -204,14 +206,17 @@ class PDFDiffViewer(QMainWindow):
         self.imgA_label.setAlignment(Qt.AlignCenter)
         self.imgA_label.setStyleSheet("background: #eee; border: 1px solid #ccc;")
         self.imgA_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
         self.imgB_label = ZoomLabel("PDF B", self, 'B')
         self.imgB_label.setAlignment(Qt.AlignCenter)
         self.imgB_label.setStyleSheet("background: #eee; border: 1px solid #ccc;")
         self.imgB_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
         self.diff_label = ZoomLabel("Diff", self, 'D')
         self.diff_label.setAlignment(Qt.AlignCenter)
         self.diff_label.setStyleSheet("background: #eee; border: 1px solid #ccc;")
         self.diff_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
         img_layout.addWidget(self.imgA_label, stretch=1)
         img_layout.addWidget(self.imgB_label, stretch=1)
         img_layout.addWidget(self.diff_label, stretch=1)
@@ -223,6 +228,13 @@ class PDFDiffViewer(QMainWindow):
         self.page_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         bottom_bar.addWidget(self.page_label)
         bottom_bar.addStretch(1)
+
+         # spinner overlay: create AFTER setCentralWidget so it stays above the central widget
+        self.spinner = LoadingSpinner(self, size=24)
+        self.spinner.setStyleSheet("background: rgba(255,255,255,200); border-radius: 10px;")
+        self.spinner.setFixedSize(24, 24)
+        self.spinner.raise_()
+
         zoom_label = QLabel("Zoom:")
         self.zoom_slider = QSlider(Qt.Horizontal)
         self.zoom_slider.setMinimum(10)  # 0.1x
@@ -237,6 +249,7 @@ class PDFDiffViewer(QMainWindow):
         self.zoom_input = QLineEdit(str(self.zoom_factor))
         self.zoom_input.setFixedWidth(50)
         self.zoom_input.editingFinished.connect(self._on_zoom_input)
+        bottom_bar.addWidget(self.spinner)
         bottom_bar.addWidget(zoom_label)
         bottom_bar.addWidget(self.zoom_slider)
         bottom_bar.addWidget(self.zoom_input)
@@ -260,9 +273,9 @@ class PDFDiffViewer(QMainWindow):
         # Add keyboard shortcuts for page navigation
         QShortcut(QKeySequence("Ctrl+Right"), self, self.next_page)
         QShortcut(QKeySequence("Ctrl+Left"), self, self.prev_page)
+        QShortcut(QKeySequence("Ctrl+Down"), self, self.reset_view)
         QShortcut(QKeySequence("Alt+Right"), self, lambda: self.goto_diff(1))
         QShortcut(QKeySequence("Alt+Left"), self, lambda: self.goto_diff(-1))
-        QShortcut(QKeySequence("Alt+Down"), self, self.reset_view)
 
     def export_compared_pdf(self):
         """
@@ -422,38 +435,41 @@ class PDFDiffViewer(QMainWindow):
         self.update_page_label()
 
     def compare(self):
-        try:
-            self.diffs = []
-            self.diff_bboxes = []
-            self.current_diff_idx = 0
-            if self.rendererA and self.rendererB:
-                countA = self.rendererA.get_page_count()
-                countB = self.rendererB.get_page_count()
-                n_pages = min(countA, countB)
-                for i in range(n_pages):
-                    imgA = self.rendererA.render_page(i, dpi=self.dpi)
-                    imgB = self.rendererB.render_page(i, dpi=self.dpi)
-                    alignedB, _ = self.register.align(imgA, imgB)
-                    mask = self.diff_engine.compute_diff(imgA, alignedB)
-                    diff_img = self.overlay_mask(imgA, mask)
-                    self.diffs.append(diff_img)
-                    # --- Improved diff region detection ---
-                    # Morphological closing to merge nearby regions
-                    kernel = np.ones((7, 7), np.uint8)
-                    closed_mask = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
-                    # Find bounding boxes of significant diff regions
-                    contours, _ = cv2.findContours(closed_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    bboxes = [cv2.boundingRect(cnt) for cnt in contours if cv2.contourArea(cnt) > 20]
-                    # sort bboxes left-to-right, top-to-bottom for predictable navigation
-                    bboxes.sort(key=lambda r: (r[1], r[0]))
-                    self.diff_bboxes.append(bboxes)
-                self.show_diff()
-            # Enable export if diffs exist
-            if hasattr(self, 'action_export'):
-                self.action_export.setEnabled(bool(self.diffs))
-        except Exception as e:
-            logging.error(f"Failed to compute all diffs: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to compute all diffs: {e}")
+        if not (self.rendererA and self.rendererB):
+            return
+
+        # show spinner
+        self.spinner.start()
+
+        from src.worker_compare import CompareWorker
+        self.thread = QThread()
+        self.worker = CompareWorker(self.rendererA, self.rendererB,
+                                    self.dpi, self.register,
+                                    self.diff_engine)
+        self.worker.moveToThread(self.thread)
+
+        self.thread.started.connect(self.worker.run)
+        self.worker.finished.connect(self._compare_done)
+        self.worker.error.connect(self._compare_error)
+
+        self.worker.finished.connect(self.thread.quit)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.thread.finished.connect(self.thread.deleteLater)
+
+        self.thread.start()
+
+    def _compare_done(self, diffs, bboxes):
+        self.spinner.stop()
+        self.diffs = diffs
+        self.diff_bboxes = bboxes
+        self.current_diff_idx = 0
+        self.show_diff()
+        self.action_export.setEnabled(True)
+
+    def _compare_error(self, msg):
+        self.spinner.stop()
+        QMessageBox.critical(self, "Error", msg)
+
 
     def goto_diff(self, direction=1):
         """
@@ -575,6 +591,14 @@ class PDFDiffViewer(QMainWindow):
             zoom = self.zoom_factor
         # When input changes, update zoom and slider, zoom from center
         self.set_zoom(zoom, center=None, update_controls=True)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "spinner"):
+            w = self.width()
+            h = self.height()
+            self.spinner.move(w // 2 - self.spinner.width() // 2,
+                            h // 2 - self.spinner.height() // 2)
 
 
 # Custom QLabel to handle wheel events for zoom
