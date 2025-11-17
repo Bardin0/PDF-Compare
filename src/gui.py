@@ -1,6 +1,7 @@
 # src/gui.py
 """
 Main PySide6 application and synchronized views.
+Unified single pan and zoom for all three PDF views.
 """
 
 import sys
@@ -43,30 +44,40 @@ class PDFDiffViewer(QMainWindow):
         highlight[:, :] = yellow_bgr
         # Blend highlight where padded_mask is set
         mask_indices = padded_mask > 0
-        # cv2.addWeighted works on arrays of same shape; index returns N x 3 arrays
         if mask_indices.ndim == 2:
             try:
                 overlay[mask_indices] = cv2.addWeighted(
                     overlay[mask_indices], 1.0 - alpha, highlight[mask_indices], alpha, 0
                 )
             except Exception:
-                # Fallback: assign color directly if blend fails
                 overlay[mask_indices] = yellow_bgr
         else:
             overlay[mask_indices] = yellow_bgr
         return overlay
 
-    def scale_to_label(self, img, label, zoom=1.0):
-        # Scale image to fill label area while maintaining aspect ratio, then apply zoom and pan
+    def scale_to_label(self, img, label, zoom=None):
+        """
+        Scale image to fill label area while maintaining aspect ratio, then apply
+        the global zoom and global pan (self._pan).
+        - self._pan is in image pixel coordinates (image-space offset).
+        - zoom is optional; if None, use self.zoom_factor.
+        """
+        if zoom is None:
+            zoom = self.zoom_factor
         label_width = label.width() if label.width() > 0 else 350
         label_height = label.height() if label.height() > 0 else 600
         h, w = img.shape[:2]
+
+        # Scale (this scale is px per image pixel after fitting and zoom)
         scale = min(label_width / w, label_height / h) * zoom
-        # Pan offset (in image pixel coordinates)
-        pan = getattr(label, '_pan', [0.0, 0.0])
+
+        # Use global pan (image-space offsets)
+        pan = getattr(self, "_pan", [0.0, 0.0])
+
         # Resize
         if scale != 1.0:
             img = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
+
         # Crop to label size, centered and panned
         img_h, img_w = img.shape[:2]
         cx = img_w // 2 - int(pan[0] * scale)
@@ -75,10 +86,12 @@ class PDFDiffViewer(QMainWindow):
         y0 = max(0, cy - label_height // 2)
         x1 = min(img_w, x0 + label_width)
         y1 = min(img_h, y0 + label_height)
+
         if img.ndim == 3:
             cropped = np.zeros((label_height, label_width, 3), dtype=img.dtype)
         else:
             cropped = np.zeros((label_height, label_width), dtype=img.dtype)
+
         crop = img[y0:y1, x0:x1]
         ch, cw = crop.shape[:2]
         cropped[0:ch, 0:cw] = crop
@@ -92,7 +105,6 @@ class PDFDiffViewer(QMainWindow):
         if img is None:
             return QPixmap()
         if img.dtype != np.uint8:
-            # safe normalization
             mn = float(img.min())
             mx = float(img.max())
             if mx - mn == 0:
@@ -100,16 +112,13 @@ class PDFDiffViewer(QMainWindow):
             else:
                 img = (255 * (img - mn) / (mx - mn)).astype(np.uint8)
         if img.ndim == 2:
-            # Grayscale
             h, w = img.shape
             qimg = QImage(img.data, w, h, w, QImage.Format_Grayscale8)
         elif img.ndim == 3 and img.shape[2] == 3:
-            # BGR -> RGB for display
             rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb.shape
             qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
         elif img.ndim == 3 and img.shape[2] == 4:
-            # BGRA -> RGBA
             rgba = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
             h, w, ch = rgba.shape
             qimg = QImage(rgba.data, w, h, ch * w, QImage.Format_RGBA8888)
@@ -120,9 +129,15 @@ class PDFDiffViewer(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PDF Image Diff Viewer")
-        self.resize(1200, 800)  # Initial size, but resizable
+        self.resize(1200, 800)
         self.setMinimumSize(1000, 600)
+
+        # Global pan (image-space) and zoom used by all panels
+        self._pan = [0.0, 0.0]     # [x, y] image-space offset (pixels)
+        self.zoom_factor = 1.0     # shared zoom
+
         self._init_ui()
+
         self.rendererA = None
         self.rendererB = None
         self.pageA = 0
@@ -130,14 +145,12 @@ class PDFDiffViewer(QMainWindow):
         self.page_countA = 1
         self.page_countB = 1
         self.dpi = 150
-        self.zoom_factor = 1.0  # Initial zoom factor
         self.register = PageRegister()
-        self.diff_engine = DiffEngine()   
-        self.diffs = []  # Store computed diffs for all pages
-        self.diff_bboxes = []  # bounding boxes per page
+        self.diff_engine = DiffEngine()
+        self.diffs = []
+        self.diff_bboxes = []
         self.current_diff_idx = 0
 
-        # Add full screen toggle shortcut (F11)
         QShortcut(QKeySequence("F11"), self, self.toggle_fullscreen)
         self._is_fullscreen = False
 
@@ -150,16 +163,14 @@ class PDFDiffViewer(QMainWindow):
             self._is_fullscreen = True
 
     def _init_ui(self):
-        # Central widget and main layout
         central = QWidget()
         main_layout = QVBoxLayout()
 
-        # Toolbar setup: all actions in one horizontal line
         toolbar = QToolBar("Main Toolbar")
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
 
-        # File menu as QToolButton
+        # File menu
         file_menu = QMenu("File", self)
         self.action_loadA = QAction("Upload PDF A", self)
         self.action_loadB = QAction("Upload PDF B", self)
@@ -176,7 +187,7 @@ class PDFDiffViewer(QMainWindow):
         file_button.setStyleSheet("QToolButton::menu-indicator { image: none; width: 0; height: 0; }")
         toolbar.addWidget(file_button)
 
-        # View menu as QToolButton
+        # View menu
         view_menu = QMenu("View", self)
         self.action_next_diff = QAction("Next Diff", self, toolTip="Next Diff (Alt+→)")
         self.action_prev_diff = QAction("Previous Diff", self, toolTip="Previous Diff (Alt+←)")
@@ -192,7 +203,7 @@ class PDFDiffViewer(QMainWindow):
         view_button.setStyleSheet("QToolButton::menu-indicator { image: none; width: 0; height: 0; }")
         toolbar.addWidget(view_button)
 
-        # Navigation/compare actions as toolbar buttons
+        # Actions
         self.action_compare = QAction("Compare", self)
         self.action_prev = QAction("Previous Page", self, toolTip="Previous Page (Ctrl+←)")
         self.action_next = QAction("Next Page", self, toolTip="Next Page (Ctrl+→)")
@@ -200,7 +211,7 @@ class PDFDiffViewer(QMainWindow):
         toolbar.addAction(self.action_prev)
         toolbar.addAction(self.action_next)
 
-        # Side-by-side layout for PDF A, PDF B, and Diff (equal, flexible)
+        # Three-panel layout
         img_layout = QHBoxLayout()
         self.imgA_label = ZoomLabel("PDF A", self, 'A')
         self.imgA_label.setAlignment(Qt.AlignCenter)
@@ -225,25 +236,23 @@ class PDFDiffViewer(QMainWindow):
         img_layout.addWidget(self.diff_label, stretch=1)
         main_layout.addLayout(img_layout)
 
-        # Bottom bar: page label (left), zoom controls (right)
+        # Bottom bar
         bottom_bar = QHBoxLayout()
         self.page_label = QLabel("Page: 1")
         self.page_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         bottom_bar.addWidget(self.page_label)
         bottom_bar.addStretch(1)
 
-         # spinner overlay: create AFTER setCentralWidget so it stays above the central widget
-        self.spinner = LoadingSpinner(self, size=24)
-        self.spinner.setStyleSheet("background: rgba(255,255,255,200); border-radius: 10px;")
-        self.spinner.setFixedSize(24, 24)
-        self.spinner.raise_()
+        # spinner - small centered overlay; created before central so resizeEvent handles centering
+        self.spinner = LoadingSpinner(self, size=48)
+        self.spinner.setStyleSheet("background: rgba(255,255,255,200); border-radius: 8px;")
+        self.spinner.setFixedSize(80, 80)
+        self.spinner.hide()  # start hidden
 
         zoom_label = QLabel("Zoom:")
         self.zoom_slider = QSlider(Qt.Horizontal)
-        self.zoom_slider.setMinimum(10)  # 0.1x
-        self.zoom_slider.setMaximum(1000)  # 10.0x
-        if not hasattr(self, 'zoom_factor'):
-            self.zoom_factor = 1.0
+        self.zoom_slider.setMinimum(10)
+        self.zoom_slider.setMaximum(1000)
         self.zoom_slider.setValue(int(self.zoom_factor * 100))
         self.zoom_slider.setTickInterval(10)
         self.zoom_slider.setSingleStep(1)
@@ -252,7 +261,7 @@ class PDFDiffViewer(QMainWindow):
         self.zoom_input = QLineEdit(str(self.zoom_factor))
         self.zoom_input.setFixedWidth(50)
         self.zoom_input.editingFinished.connect(self._on_zoom_input)
-        bottom_bar.addWidget(self.spinner)
+
         bottom_bar.addWidget(zoom_label)
         bottom_bar.addWidget(self.zoom_slider)
         bottom_bar.addWidget(self.zoom_input)
@@ -261,7 +270,12 @@ class PDFDiffViewer(QMainWindow):
         central.setLayout(main_layout)
         self.setCentralWidget(central)
 
-        # Connect actions
+        # Ensure spinner is on top and centered initially
+        self.spinner.raise_()
+        self.spinner.move(self.width() // 2 - self.spinner.width() // 2,
+                          self.height() // 2 - self.spinner.height() // 2)
+
+        # Connections
         self.action_loadA.triggered.connect(self.load_pdf_a)
         self.action_loadB.triggered.connect(self.load_pdf_b)
         self.action_export.triggered.connect(self.export_compared_pdf)
@@ -270,10 +284,8 @@ class PDFDiffViewer(QMainWindow):
         self.action_next.triggered.connect(self.next_page)
         self.action_next_diff.triggered.connect(lambda: self.goto_diff(1))
         self.action_prev_diff.triggered.connect(lambda: self.goto_diff(-1))
-        self.action_reset_view.triggered.connect(self.reset_view)  # Connect reset action
+        self.action_reset_view.triggered.connect(self.reset_view)
 
-        # Add keyboard shortcuts for diff navigation
-        # Add keyboard shortcuts for page navigation
         QShortcut(QKeySequence("Ctrl+Right"), self, self.next_page)
         QShortcut(QKeySequence("Ctrl+Left"), self, self.prev_page)
         QShortcut(QKeySequence("Ctrl+Down"), self, self.reset_view)
@@ -281,9 +293,6 @@ class PDFDiffViewer(QMainWindow):
         QShortcut(QKeySequence("Alt+Left"), self, lambda: self.goto_diff(-1))
 
     def export_compared_pdf(self):
-        """
-        Export the compared PDF (diff-highlighted images) as a new PDF file.
-        """
         if not self.diffs:
             QMessageBox.warning(self, "No Diff", "Please compare PDFs first.")
             return
@@ -296,7 +305,6 @@ class PDFDiffViewer(QMainWindow):
             import numpy as np
             doc = fitz.open()
             for img in self.diffs:
-                # Convert to RGB if needed
                 if img.ndim == 2:
                     img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
                 elif img.shape[2] == 4:
@@ -306,12 +314,10 @@ class PDFDiffViewer(QMainWindow):
                 else:
                     raise ValueError("Unsupported image shape for export")
                 height, width = img.shape[:2]
-                # Encode as PNG in memory
                 success, png_bytes = cv2.imencode('.png', img)
                 if not success:
                     raise RuntimeError("Failed to encode image as PNG for PDF export")
                 png_bytes = png_bytes.tobytes()
-                # Create PDF page and insert image from PNG stream
                 page = doc.new_page(width=width, height=height)
                 page.insert_image(page.rect, stream=png_bytes)
             doc.save(path)
@@ -322,17 +328,14 @@ class PDFDiffViewer(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to export compared PDF: {e}")
 
     def update_page_label(self):
-        # Update the page label to show current page and total
         max_pages = max(getattr(self, 'page_countA', 1), getattr(self, 'page_countB', 1))
         self.page_label.setText(f"Page: {getattr(self, 'pageA', 0) + 1} / {max_pages}")
-        # Enable export only if diffs exist
         if hasattr(self, 'action_export'):
             self.action_export.setEnabled(bool(self.diffs))
 
     def _reset_view_state(self):
-        # Reset pan and zoom state on all panels
-        for panel in [self.imgA_label, self.imgB_label, self.diff_label]:
-            panel._pan = [0.0, 0.0]
+        # Reset global pan and zoom
+        self._pan = [0.0, 0.0]
         self.zoom_factor = 1.0
         self.zoom_slider.blockSignals(True)
         self.zoom_slider.setValue(int(self.zoom_factor * 100))
@@ -342,11 +345,7 @@ class PDFDiffViewer(QMainWindow):
         self.zoom_input.blockSignals(False)
 
     def reset_view(self):
-        """
-        Reset PDFs to their default location and zoom.
-        """
         self._reset_view_state()
-        # re-render current pages at default view
         self.show_page_a()
         self.show_page_b()
         self.show_diff()
@@ -360,7 +359,6 @@ class PDFDiffViewer(QMainWindow):
                 self.page_countA = self.rendererA.get_page_count()
                 self._reset_view_state()
                 self.show_page_a()
-                # Reset diff state
                 self.diffs = []
                 self.diff_bboxes = []
                 self.current_diff_idx = 0
@@ -379,7 +377,6 @@ class PDFDiffViewer(QMainWindow):
                 self.page_countB = self.rendererB.get_page_count()
                 self._reset_view_state()
                 self.show_page_b()
-                # Reset diff state
                 self.diffs = []
                 self.diff_bboxes = []
                 self.current_diff_idx = 0
@@ -393,7 +390,7 @@ class PDFDiffViewer(QMainWindow):
         try:
             if self.rendererA:
                 img = self.rendererA.render_page(self.pageA, dpi=self.dpi)
-                img = self.scale_to_label(img, self.imgA_label, self.zoom_factor)
+                img = self.scale_to_label(img, self.imgA_label, zoom=self.zoom_factor)
                 pixmap = self.np_to_pixmap(img)
                 self.imgA_label.setPixmap(pixmap)
         except Exception as e:
@@ -404,7 +401,7 @@ class PDFDiffViewer(QMainWindow):
         try:
             if self.rendererB:
                 img = self.rendererB.render_page(self.pageB, dpi=self.dpi)
-                img = self.scale_to_label(img, self.imgB_label, self.zoom_factor)
+                img = self.scale_to_label(img, self.imgB_label, zoom=self.zoom_factor)
                 pixmap = self.np_to_pixmap(img)
                 self.imgB_label.setPixmap(pixmap)
         except Exception as e:
@@ -412,12 +409,10 @@ class PDFDiffViewer(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to render PDF B page: {e}")
 
     def prev_page(self):
-        # Move both PDFs to previous page (if possible), update only page and images
         if self.rendererA and self.pageA > 0:
             self.pageA -= 1
         if self.rendererB and self.pageB > 0:
             self.pageB -= 1
-        # Reset diff navigation for new page
         self.current_diff_idx = 0
         self.show_page_a()
         self.show_page_b()
@@ -425,12 +420,10 @@ class PDFDiffViewer(QMainWindow):
         self.update_page_label()
 
     def next_page(self):
-        # Move both PDFs to next page (if possible), update only page and images
         if self.rendererA and self.pageA < self.page_countA - 1:
             self.pageA += 1
         if self.rendererB and self.pageB < self.page_countB - 1:
             self.pageB += 1
-        # Reset diff navigation for new page
         self.current_diff_idx = 0
         self.show_page_a()
         self.show_page_b()
@@ -441,7 +434,6 @@ class PDFDiffViewer(QMainWindow):
         if not (self.rendererA and self.rendererB):
             return
 
-        # show spinner
         self.spinner.start()
 
         from src.worker_compare import CompareWorker
@@ -474,20 +466,14 @@ class PDFDiffViewer(QMainWindow):
         QMessageBox.critical(self, "Error", msg)
 
     def goto_diff(self, direction=1):
-        """
-        Navigate to the next/previous diff region on the current page, zooming to fit tightly.
-        direction: 1 for next, -1 for previous
-        """
         if not (self.diffs and self.pageA < len(self.diff_bboxes)):
             return
         bboxes = self.diff_bboxes[self.pageA]
         if not bboxes:
             return
-        # Update index and clamp
         self.current_diff_idx = (self.current_diff_idx + direction) % len(bboxes)
         x, y, w_box, h_box = bboxes[self.current_diff_idx]
 
-        # Add a small margin (5% of bbox size, at least 5px)
         margin_x = max(int(w_box * 0.05), 5)
         margin_y = max(int(h_box * 0.05), 5)
         x0 = max(0, x - margin_x)
@@ -497,79 +483,75 @@ class PDFDiffViewer(QMainWindow):
         bbox_w = x1 - x0
         bbox_h = y1 - y0
 
-        # Get the original diff image (same size as source image)
         diff_img = self.diffs[self.pageA]
         img_h, img_w = diff_img.shape[:2]
 
-        # Compute zoom to fit bbox tightly in view (based on image coords -> label fit)
-        label = self.imgA_label  # labels are same size layout-wise
+        label = self.imgA_label
         label_width = label.width() if label.width() > 0 else 350
         label_height = label.height() if label.height() > 0 else 600
 
-        # compute base scale (fit-to-label) then compute additional zoom so bbox fills label
         base_scale_x = label_width / img_w
         base_scale_y = label_height / img_h
         base_scale = min(base_scale_x, base_scale_y)
-        # required final_scale to make bbox fill label:
+
         req_scale_x = label_width / bbox_w
         req_scale_y = label_height / bbox_h
         req_final_scale = min(req_scale_x, req_scale_y)
-        # derive target zoom_factor = req_final_scale / base_scale
+
         if base_scale <= 0:
             target_zoom = 1.0
         else:
             target_zoom = req_final_scale / base_scale
-        # clamp zoom
+
         target_zoom = max(0.1, min(target_zoom, 10.0))
 
-        # Compute bbox center in image coordinates
         cx_img = x0 + bbox_w / 2.0
         cy_img = y0 + bbox_h / 2.0
 
-        # Compute pan such that center point ends up in the center of the label.
         pan_x = (img_w / 2.0) - cx_img
         pan_y = (img_h / 2.0) - cy_img
 
-        # Apply pan to all panels (image-coordinates style)
-        for panel in [self.imgA_label, self.imgB_label, self.diff_label]:
-            panel._pan = [pan_x, pan_y]
+        # set global pan
+        self._pan = [pan_x, pan_y]
 
-        # Apply zoom (this will update controls and redraw)
+        # apply zoom and redraw
         self.set_zoom(target_zoom, center=None, update_controls=True)
 
-        # Optionally show a short-lived visual indicator: draw bbox on diff view
         try:
             disp = diff_img.copy()
-            # draw bbox in red on image coordinate space
             x0i = int(x0); y0i = int(y0); x1i = int(x1); y1i = int(y1)
             cv2.rectangle(disp, (x0i, y0i), (x1i, y1i), (0, 0, 255), 2)
-            disp_scaled = self.scale_to_label(disp, self.diff_label, self.zoom_factor)
+            disp_scaled = self.scale_to_label(disp, self.diff_label, zoom=self.zoom_factor)
             pixmap = self.np_to_pixmap(disp_scaled)
             self.diff_label.setPixmap(pixmap)
         except Exception:
             pass
 
     def show_diff(self):
-        # Show only the diff for the current page
         if self.diffs and 0 <= self.pageA < len(self.diffs):
             diff_img = self.diffs[self.pageA]
-            diff_img = self.scale_to_label(diff_img, self.diff_label, self.zoom_factor)
+            diff_img = self.scale_to_label(diff_img, self.diff_label, zoom=self.zoom_factor)
             pixmap = self.np_to_pixmap(diff_img)
             self.diff_label.setPixmap(pixmap)
         else:
             self.diff_label.clear()
 
     def set_zoom(self, factor, center=None, update_controls=True):
-        # Clamp zoom factor
         old_zoom = self.zoom_factor
         self.zoom_factor = max(0.1, min(factor, 10.0))
-        # Adjust pan to keep mouse position stable if center is given
+        # If a center is provided (label-local coords), adjust global pan so that
+        # the point under the cursor stays stable.
         if center is not None:
-            for label in [self.imgA_label, self.imgB_label, self.diff_label]:
-                label.adjust_pan_for_zoom(center, old_zoom, self.zoom_factor)
-        # Update slider and input if needed
+            # center is expected to be tuple (label, (x,y)) or None.
+            # For backward compatibility accept (x,y) as label-local coords on active label.
+            if isinstance(center, tuple) and len(center) == 2 and isinstance(center[0], QLabel):
+                label, (cx, cy) = center
+                # Convert center from label-local to image-space and update self._pan
+                self._adjust_global_pan_from_label_center(label, (cx, cy), old_zoom, self.zoom_factor)
+            elif isinstance(center, tuple) and len(center) == 2:
+                # No label given, assume center coordinates refers to active label (diff_label)
+                self._adjust_global_pan_from_label_center(self.diff_label, center, old_zoom, self.zoom_factor)
         if update_controls:
-            # Synchronize slider and input, block signals to prevent recursion
             self.zoom_slider.blockSignals(True)
             self.zoom_slider.setValue(int(self.zoom_factor * 100))
             self.zoom_slider.blockSignals(False)
@@ -580,10 +562,26 @@ class PDFDiffViewer(QMainWindow):
         self.show_page_b()
         self.show_diff()
 
+    def _adjust_global_pan_from_label_center(self, label, center, old_zoom, new_zoom):
+        """
+        Given a label and a center point in label-local coords, compute the global image-space pan
+        so that the image point under that center remains under the center after zoom change.
+        """
+        if center is None:
+            return
+        label_width = label.width() if label.width() > 0 else 350
+        label_height = label.height() if label.height() > 0 else 600
+        x, y = center
+        # compute image-space point under (x,y) at old zoom
+        img_x = (x - label_width / 2.0) / old_zoom - self._pan[0]
+        img_y = (y - label_height / 2.0) / old_zoom - self._pan[1]
+        # compute new pan so image point remains under same label coords
+        new_pan_x = (x - label_width / 2.0) / new_zoom - img_x
+        new_pan_y = (y - label_height / 2.0) / new_zoom - img_y
+        self._pan = [new_pan_x, new_pan_y]
+
     def _on_zoom_slider(self, value):
-        # Slider value is 10-1000, representing 0.1x to 10.0x
         zoom = value / 100.0
-        # When slider changes, update zoom and input field, zoom from center
         self.set_zoom(zoom, center=None, update_controls=True)
 
     def _on_zoom_input(self):
@@ -591,7 +589,6 @@ class PDFDiffViewer(QMainWindow):
             zoom = float(self.zoom_input.text())
         except Exception:
             zoom = self.zoom_factor
-        # When input changes, update zoom and slider, zoom from center
         self.set_zoom(zoom, center=None, update_controls=True)
 
     def resizeEvent(self, event):
@@ -600,9 +597,10 @@ class PDFDiffViewer(QMainWindow):
             w = self.width()
             h = self.height()
             self.spinner.move(w // 2 - self.spinner.width() // 2,
-                            h // 2 - self.spinner.height() // 2)
+                              h // 2 - self.spinner.height() // 2)
 
-# Custom QLabel to handle wheel events for zoom
+
+# Custom QLabel to handle wheel events for zoom & drag panning
 class ZoomLabel(QLabel):
     def __init__(self, text, parent, which):
         super().__init__(text)
@@ -611,36 +609,11 @@ class ZoomLabel(QLabel):
         self.setMouseTracking(True)
         self._drag_active = False
         self._last_pos = None
-        self._pan = [0.0, 0.0]  # [x, y] pan offset in image coordinates
 
     def wheelEvent(self, event):
-        """
-        Zoom only when the mouse is over this label. Zoom towards the exact cursor
-        location on the hovered PDF; compute corresponding points for the other panels
-        so they zoom in a synchronized manner toward the same visual spot.
-        """
         delta = event.angleDelta().y()
         if delta == 0:
             return
-
-        # High-resolution position where wheel event occurred (local coords)
-        try:
-            posf = event.position()  # QPointF in Qt6
-            pos_point = posf.toPoint()
-            local_x = posf.x()
-            local_y = posf.y()
-        except Exception:
-            # Fallback for older event API
-            pos_point = event.pos()
-            local_x = pos_point.x()
-            local_y = pos_point.y()
-
-        # Only zoom when cursor is inside this widget bounds
-        if not (0 <= local_x < self.width() and 0 <= local_y < self.height()):
-            return
-
-        # Global position for mapping to other panels
-        global_pos = self.mapToGlobal(pos_point)
 
         zoom_step = 1.25
         old_zoom = self.parent.zoom_factor
@@ -649,27 +622,15 @@ class ZoomLabel(QLabel):
         else:
             new_zoom = max(old_zoom / zoom_step, 0.1)
 
-        # If no zoom change, skip
         if abs(new_zoom - old_zoom) < 1e-6:
             return
 
-        # Compute per-panel centers: map the global cursor into each panel's local coords.
-        panels = [self.parent.imgA_label, self.parent.imgB_label, self.parent.diff_label]
-        centers = []
-        for panel in panels:
-            local = panel.mapFromGlobal(global_pos)
-            if 0 <= local.x() < panel.width() and 0 <= local.y() < panel.height():
-                centers.append((local.x(), local.y()))
-            else:
-                # If cursor not over that panel, use its center so the visual stays coherent.
-                centers.append((panel.width() // 2, panel.height() // 2))
-
-        # Apply the zoom and adjust pan for each panel so the point under the cursor remains stable.
+        # Update global zoom and for each panel adjust global pan to keep the relevant point stable.
+        # We will prioritize the actual panel under the cursor (self) for pan stability by using its center.
         self.parent.zoom_factor = new_zoom
-        for panel, center in zip(panels, centers):
-            panel.adjust_pan_for_zoom(center, old_zoom, new_zoom)
+        # If the cursor is over this specific label, use its local coords as center; otherwise use panel center.
 
-        # Update slider and input
+        # Update controls
         self.parent.zoom_slider.blockSignals(True)
         self.parent.zoom_slider.setValue(int(self.parent.zoom_factor * 100))
         self.parent.zoom_slider.blockSignals(False)
@@ -683,7 +644,6 @@ class ZoomLabel(QLabel):
         self.parent.show_diff()
 
     def mousePressEvent(self, event):
-
         if event.button() == Qt.LeftButton and self.which in ['A', 'B']:
             if self.which == 'A' and not self.parent.rendererA:
                 self.parent.load_pdf_a()
@@ -695,19 +655,28 @@ class ZoomLabel(QLabel):
             self._last_pos = event.pos()
 
     def mouseMoveEvent(self, event):
-        if self._drag_active and self._last_pos is not None:
+        # Only drag if left button is currently pressed
+        if (event.buttons() & Qt.LeftButton) and self._drag_active and self._last_pos is not None:
             delta = event.pos() - self._last_pos
             self._last_pos = event.pos()
-            # Increase speed (e.g., 2x) and invert directionality
             speed = 2.0
             dx = int(delta.x() * speed / max(self.parent.zoom_factor, 1e-6))
             dy = int(delta.y() * speed / max(self.parent.zoom_factor, 1e-6))
-            for label in [self.parent.imgA_label, self.parent.imgB_label, self.parent.diff_label]:
-                label._pan[0] += dx
-                label._pan[1] += dy
+            self.parent._pan[0] += dx
+            self.parent._pan[1] += dy
             self.parent.show_page_a()
             self.parent.show_page_b()
             self.parent.show_diff()
+        else:
+            # If the left button is not pressed, stop dragging
+            self._drag_active = False
+            self._last_pos = None
+        super().mouseMoveEvent(event)
+    def leaveEvent(self, event):
+        # If the mouse leaves the widget, stop dragging
+        self._drag_active = False
+        self._last_pos = None
+        super().leaveEvent(event)
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -715,32 +684,23 @@ class ZoomLabel(QLabel):
             self._last_pos = None
 
     def adjust_pan_for_zoom(self, center, old_zoom, new_zoom):
-        # Adjust pan so the point under the mouse stays under the mouse after zoom
+        """
+        Backwards-compatible stub: delegate to parent helper with this label as context.
+        center: (x, y) label-local coords
+        """
         if center is None:
             return
-        label_width = self.width() if self.width() > 0 else 350
-        label_height = self.height() if self.height() > 0 else 600
-        x, y = center
-        # Convert label coords to image coords at old zoom
-        img_x = (x - label_width / 2.0) / old_zoom - self._pan[0]
-        img_y = (y - label_height / 2.0) / old_zoom - self._pan[1]
-        # After zoom, set pan so that this image point is exactly under the mouse
-        new_pan_x = (x - label_width / 2.0) / new_zoom - img_x
-        new_pan_y = (y - label_height / 2.0) / new_zoom - img_y
-        self._pan[0] = new_pan_x
-        self._pan[1] = new_pan_y
+        self.parent._adjust_global_pan_from_label_center(self, center, old_zoom, new_zoom)
 
     @staticmethod
     def overlay_mask(img: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """
-        Keep this helper aligned with main overlay color (yellow BGR)
-        """
         overlay = img.copy()
         if overlay.ndim == 2:
             overlay = cv2.cvtColor(overlay, cv2.COLOR_GRAY2BGR)
         yellow_bgr = np.array([0, 255, 255], dtype=np.uint8)
         overlay[mask > 0] = yellow_bgr
         return overlay
+
 
 def main():
     app = QApplication(sys.argv)
