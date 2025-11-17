@@ -676,10 +676,6 @@ class SliderCompositeWidget(QWidget):
         self._drag_active = False
         self._last_pos = None
     def wheelEvent(self, event):
-        # Hide temp diff rect on zoom
-        if hasattr(self.parent, 'slider_temp_diff_rect') and self.parent.slider_temp_diff_rect is not None:
-            self.parent.slider_temp_diff_rect = None
-            self.repaint()
         delta = event.angleDelta().y()
         if delta == 0:
             return
@@ -699,20 +695,16 @@ class SliderCompositeWidget(QWidget):
         self.repaint()
 
     def mousePressEvent(self, event):
-        # Hide temp diff rect on mouse press
-        if hasattr(self.parent, 'slider_temp_diff_rect') and self.parent.slider_temp_diff_rect is not None:
-            self.parent.slider_temp_diff_rect = None
-            self.repaint()
         if event.button() == Qt.LeftButton:
             self._drag_active = True
             self._last_pos = event.pos()
+            # Clear temp diff rect on user interaction
+            if hasattr(self.parent, 'slider_temp_diff_rect') and self.parent.slider_temp_diff_rect is not None:
+                self.parent.slider_temp_diff_rect = None
+                self.repaint()
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        # Hide temp diff rect on mouse move (drag)
-        if hasattr(self.parent, 'slider_temp_diff_rect') and self.parent.slider_temp_diff_rect is not None:
-            self.parent.slider_temp_diff_rect = None
-            self.repaint()
         viewer = self.parent
         if (event.buttons() & Qt.LeftButton) and self._drag_active and self._last_pos is not None:
             delta = event.pos() - self._last_pos
@@ -726,6 +718,10 @@ class SliderCompositeWidget(QWidget):
             viewer.show_page_b()
             viewer.show_diff()
             self.repaint()
+            # Clear temp diff rect on user drag
+            if hasattr(viewer, 'slider_temp_diff_rect') and viewer.slider_temp_diff_rect is not None:
+                viewer.slider_temp_diff_rect = None
+                self.repaint()
         else:
             self._drag_active = False
             self._last_pos = None
