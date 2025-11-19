@@ -1,0 +1,1 @@
+pyinstaller --specpath "dist/" -n CITDiff --add-data "../res/;res" --optimize 2 --upx-dir="C:\Users\mgiovannini\Downloads\upx-5.0.2-win64" --splash "../res/logo.jpg" -y main.py
