@@ -4,6 +4,10 @@ from PySide6.QtWidgets import QLabel
 from PySide6.QtGui import QMovie
 from PySide6.QtCore import Qt, QSize
 
+import logging
+
+logging.basicConfig(level=logging.INFO)
+
 class LoadingSpinner(QLabel):
     """
     QLabel-based overlay spinner. Looks for a spinner.gif under:
@@ -24,19 +28,17 @@ class LoadingSpinner(QLabel):
             if p.exists():
                 gif_file = p
         else:
-            # Typical locations: project_root/res/spinner.gif or src/spinner.gif
-            here = Path(__file__).resolve().parent
-            candidate = here.parent / "res" / "spinner.gif"  # <project>/res/spinner.gif
-            if candidate.exists():
-                gif_file = candidate
+            # __file__ will place us in .../<project>/_internal/src/spinner.py
+            spinner_path = Path(__file__).resolve().parent.parent.joinpath("res", "spinner.gif")
+            if spinner_path.exists():
+                gif_file = spinner_path
+                logging.info(f"Found spinner GIF at {spinner_path}.")
             else:
-                candidate2 = here / "spinner.gif"  # src/spinner.gif
-                if candidate2.exists():
-                    gif_file = candidate2
+                logging.warning(f"Spinner GIF not found at {spinner_path}.")
 
         self._has_movie = False
         if gif_file is not None:
-            movie = QMovie(str(gif_file))
+            movie = QMovie(str(gif_file.resolve()))
             # scale the gif frames to requested size
             movie.setScaledSize(QSize(size, size))
             if movie.isValid():
@@ -47,10 +49,12 @@ class LoadingSpinner(QLabel):
                 # invalid movie file -> fallback to text
                 self.movie = None
                 self.setText("Loading...")
+                logging.error(f"Invalid spinner GIF.\n {movie.lastError()}")
         else:
             # no gif file -> fallback to text
             self.movie = None
             self.setText("Loading...")
+            logging.warning("No spinner GIF found. Using text fallback.")
 
         self.hide()
 

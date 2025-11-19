@@ -16,6 +16,8 @@ from PySide6.QtCore import Qt, QThread
 import numpy as np
 import cv2
 import logging
+import pyi_splash
+
 from src.renderer import PDFRenderer
 from src.register import PageRegister
 from src.diff_engine import DiffEngine
@@ -1153,7 +1155,9 @@ class FadeCompositeWidget(QWidget):
         painter.end()
 
 def main():
+    pyi_splash.update_text("Starting CTIDiff... Hang on! (Its a touch slow)")
     app = QApplication(sys.argv)
     viewer = PDFDiffViewer()
     viewer.show()
+    pyi_splash.close()
     sys.exit(app.exec())
